@@ -1,1 +1,1 @@
-# nexus-agent-sdk-py
+# nexus-agentic-x
