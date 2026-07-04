@@ -1,0 +1,55 @@
+# === 只包含发布必要的文件 ===
+
+# 必要的元数据文件
+include README.md
+include LICENSE
+include pyproject.toml
+
+# 只包含 agenticx 源码包
+recursive-include agenticx *.py
+recursive-include agenticx *.yaml
+recursive-include agenticx *.yml
+recursive-include agenticx *.json
+recursive-include agenticx *.toml
+
+# === 严格排除所有非必要文件 ===
+
+# 开发和构建文件
+exclude .gitignore
+exclude .pre-commit-config.yaml
+exclude setup.py
+exclude requirements.txt
+exclude *.md
+global-exclude *.md
+prune .github
+
+# 开发目录（完全排除）
+prune tests
+prune examples  
+prune docs
+prune assets
+prune thirdparty
+prune researches
+prune markmap
+prune exps
+
+# 构建产物和缓存
+prune build
+prune dist
+prune *.egg-info
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
+recursive-exclude * *.pyc
+recursive-exclude * *.pyo
+recursive-exclude * *.orig
+recursive-exclude * *.rej
+recursive-exclude * .DS_Store
+recursive-exclude * Thumbs.db
+prune .git
+prune .pytest_cache
+prune .coverage
+prune htmlcov
+
+# 但要包含 README.md 和 LICENSE (前面已经显式 include)
+include README.md
+include LICENSE 

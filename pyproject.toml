@@ -1,0 +1,344 @@
+[build-system]
+requires = ["setuptools>=77.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenticx"
+version = "0.4.2"
+description = "A unified, scalable, production-ready multi-agent application development framework"
+authors = [
+    {name = "Ziran Li", email = "bingzhenli@hotmail.com"},
+]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Topic :: System :: Distributed Computing",
+]
+keywords = ["ai", "agents", "multi-agent", "framework", "automation", "llm", "workflow", "orchestration"]
+
+dependencies = [
+    # ── 核心依赖（轻量，无 torch，秒装）──
+    # 基础框架
+    "pydantic>=2.0.0",
+    "typing-extensions>=4.0.0,<5",
+    "loguru>=0.7.0,<1",
+    "rich>=13.0.0,<14",
+    "click>=8.0.0,<9",
+    "PyYAML>=6.0,<7",
+    "json5>=0.9.25,<1",
+    "tomli>=2.0,<3; python_version<'3.11'",
+    "jinja2>=3.0.0,<4",
+    "python-dotenv>=1.0.0,<2",
+    # 网络 / HTTP
+    "httpx>=0.25.0,<1",
+    "requests>=2.31.0,<3",
+    "aiohttp>=3.9.0,<4",
+    "aiofiles>=23.0.0,<25",
+    "websockets>=12.0",
+    # Web 框架
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    # FastAPI Form/File/UploadFile 解析 multipart/form-data 必需，
+    # 缺失会在 PyInstaller 打包后的干净 venv 中触发 RuntimeError。
+    "python-multipart>=0.0.9,<1",
+    "typer>=0.9.0,<1",
+    # LLM 核心（固定版本范围，加速依赖解析）
+    "openai>=1.50.0,<3",
+    "litellm>=1.50.0,<2",
+    "tiktoken>=0.7.0,<1",
+    "tokenizers>=0.19.0,<1",
+    "huggingface-hub>=0.24.0,<1",
+    # 核心工具库
+    "docstring-parser>=0.11,<0.16",  # FunctionTool 需要解析 docstring；0.15+ 为 agentkit-sdk-python 所需
+    # 通用工具
+    "ujson>=5.8.0,<6",
+    "tqdm>=4.65.0,<5",
+    "joblib>=1.3.0,<2",
+    "chardet>=5.0.0,<6",
+    "psutil>=5.9.0,<6",
+    "structlog>=23.1.0,<25",
+    "watchdog>=3.0.0,<5",
+]
+
+[project.optional-dependencies]
+# ── 桌面打包最小运行时 ──
+# PyInstaller 打出来的 agx-server 需要这些包在 venv 里，才能：
+#   - 解析 PDF（PyMuPDF 优先，pypdf 兜底；若都缺，PDFReader 会抛
+#     "No PDF library available"）
+#   - 解析 Word/PowerPoint（python-docx / python-pptx / docx2txt）
+#   - 满足 agenticx.knowledge 下游模块对 numpy 的隐式要求，避免
+#     "agenticx.knowledge.readers unavailable: No module named 'numpy'"
+# packaging/build_backend.sh 与 build_windows_installer.ps1 都必须用
+# `pip install "$PROJECT_ROOT[desktop-runtime]"` 安装本组。
+desktop-runtime = [
+    "PyMuPDF>=1.23.0,<2",
+    "pypdf>=3.15.0,<5",
+    "python-docx>=0.8.11,<2",
+    "python-pptx>=0.6.21,<1",
+    "docx2txt>=0.8,<1",
+    "numpy>=1.24.0,<2",
+    # 知识库默认向量后端：agenticx.studio.kb.runtime._ChromaBackend 直接
+    # `import chromadb`，缺失时 UI 上抛 "chromadb is required..." 而打包
+    # 后的桌面端用户没法 pip install 进 bundle。
+    "chromadb>=0.5.0,<1",
+    # chromadb 默认 embedding / 部分 segment 实现会动态 import onnxruntime；
+    # 未显式安装时运行时报 "The onnxruntime python package is not installed"。
+    # PyInstaller 同样需要 collect_all("onnxruntime") 才能打入 native 库。
+    "onnxruntime>=1.17.0,<2",
+    # Studio 的 MCP 面板 / auto-connect 强依赖官方 mcp SDK；
+    # 缺失时 MCPClientV2._create_session 里 stdio_client=None，所有连接
+    # 会以 "TypeError: 'NoneType' object is not callable" 静默失败。
+    "mcp>=1.0.0,<2",
+    "semble>=0.1.10,<0.2.0",
+    "pathspec>=1.0.0",
+    # 本机 shell / agx serve 继承 ALL_PROXY=socks5://… 时，httpx / OpenAI SDK / LiteLLM
+    # 向量化会走 SOCKS；缺 socksio 则入库阶段才抛 ImportError。
+    "socksio>=1.0.0,<2",
+]
+# ── 额外 LLM 提供者 ──
+llm = [
+    "anthropic>=0.40.0,<1",
+    "ollama>=0.3.0,<1",
+]
+# ── 记忆系统（向量存储 / 持久化）──
+memory = [
+    "mem0ai>=0.1.0,<1",
+    "chromadb>=0.5.0,<1",
+    "qdrant-client>=1.10.0,<2",
+    "redis>=5.0.0,<6",
+    "pymilvus>=2.4.0,<3",
+    "numpy>=1.24.0,<2",
+]
+# ── Graphiti temporal memory graph (Near memory graph panel) ──
+graphiti = [
+    "graphiti-core[kuzu]>=0.29.1,<0.30",
+]
+# ── 文档处理 ──
+# 注意：pytesseract 需要 tesseract (brew install tesseract)
+#        pdf2image 需要 poppler (brew install poppler)
+#        docx2txt 处理旧版 .doc 需要 antiword (brew install antiword)
+document = [
+    "PyMuPDF>=1.23.0,<2",
+    "pypdf>=3.15.0,<5",
+    "PyPDF2>=3.0.0,<4",
+    "python-docx>=0.8.11,<2",
+    "python-pptx>=0.6.21,<1",
+    "docx2txt>=0.8,<1",
+    "pytesseract>=0.3.10,<1",
+    "pdf2image>=1.16.0,<2",
+]
+# ── OCR（单独隔离，会拉入 torch ~2 GB）──
+ocr = [
+    "easyocr>=1.7.0,<2",
+]
+# ── 知识图谱 / 图分析 ──
+graph = [
+    "networkx>=3.1,<4",
+    "neo4j>=5.12.0,<6",
+    "cdlib>=0.3.0,<1",
+    "wurlitzer>=3.0.0,<4",
+    "bayanpy>=0.0.6,<1",
+    "infomap>=2.7.0,<3",
+    "pyclustering>=0.10.0,<1",
+    "ASLPAw>=2.1.0,<3",
+    "leidenalg>=0.10.0,<1",
+]
+# ── 数据分析 / 可视化 ──
+data = [
+    "pandas>=2.0.0,<3",
+    "numpy>=1.24.0,<2",
+    "scikit-learn>=1.3.0,<2",
+    "scipy>=1.11.0,<2",
+    "matplotlib>=3.7.0,<4",
+    "seaborn>=0.12.0,<1",
+    "plotly>=5.15.0,<6",
+]
+# ── 可观测性 / 监控 ──
+monitoring = [
+    "prometheus-client>=0.17.0,<1",
+    "opentelemetry-api>=1.20.0,<2",
+    "opentelemetry-sdk>=1.20.0,<2",
+]
+# ── 数据库后端 ──
+database = [
+    "psycopg2-binary>=2.9.0,<3",
+    "SQLAlchemy>=2.0.0,<3",
+    "cryptography>=41.0.0,<45",
+]
+# ── 代码语义索引（Semble）──
+code_index = [
+    "semble>=0.1.10,<0.2.0",
+    "pathspec>=1.0.0",
+]
+# ── MCP 协议 ──
+mcp = [
+    "mcp>=1.0.0,<2",
+]
+# ── MQTT 协议 ──
+mqtt = [
+    "asyncio-mqtt>=0.16.0,<1",
+]
+# ── 文本相似度 ──
+text = [
+    "python-Levenshtein>=0.21.0,<1",
+    "RapidFuzz>=3.0.0,<4",
+]
+# ── Server 生产级（认证 + Redis 共享状态）──
+server = [
+    "PyJWT>=2.8.0",
+    "redis>=5.0.0,<6",
+]
+# ── 火山引擎 AgentKit ──
+volcengine = [
+    "agentkit-sdk-python>=0.2.0,<0.6",
+]
+# ── 文档构建 ──
+docs = [
+    "mkdocs>=1.5.0,<2",
+    "mkdocs-material>=9.0.0,<10",
+    "mkdocstrings>=0.22.0,<1",
+    "mkdocs-autorefs>=0.4.0,<2",
+    "pydoc-markdown>=4.8.0,<5",
+    "docstring-parser>=0.11,<0.16",
+]
+# ── 开发工具 ──
+dev = [
+    "pytest>=7.4.0,<9",
+    "pytest-asyncio>=0.21.0,<1",
+    "pytest-cov>=4.0.0,<6",
+    "black>=23.0.0,<25",
+    "isort>=5.12.0,<6",
+    "flake8>=6.0.0,<8",
+    "mypy>=1.0.0,<2",
+    "pre-commit>=3.0.0,<4",
+]
+# ── 全部功能（不含 dev/docs）──
+all = [
+    "agenticx[llm,memory,document,ocr,graph,data,monitoring,database,mcp,mqtt,text,volcengine]",
+]
+
+[project.urls]
+Homepage = "https://github.com/DemonDamon/AgenticX"
+Documentation = "https://agenticx.ai/docs"
+Repository = "https://github.com/DemonDamon/AgenticX"
+Issues = "https://github.com/DemonDamon/AgenticX/issues"
+Discussions = "https://github.com/DemonDamon/AgenticX/discussions"
+
+[project.scripts]
+agenticx = "agenticx.cli.main:main"
+agx = "agenticx.cli.main:main"
+
+[tool.setuptools.packages.find]
+# 只包含 agenticx 包，排除所有其他目录
+include = ["agenticx*"]
+exclude = ["tests*", "examples*", "docs*", "thirdparty*", "researches*", "markmap*", "exps*", "assets*"]
+
+[tool.setuptools.package-data]
+agenticx = [
+    "*.yaml", "*.yml", "*.json", "*.toml", "*.txt", "*.md",
+    "**/*.yaml", "**/*.yml", "**/*.json", "**/*.toml", "**/*.txt", "**/*.md"
+]
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "--verbose",
+    "--cov=agenticx",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-report=xml",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+
+[tool.coverage.run]
+source = ["agenticx"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+    "*/examples/*",
+    "*/benchmarks/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ["E203", "W503"]
+exclude = [
+    ".git",
+    "__pycache__",
+    "docs/source/conf.py",
+    "old",
+    "build",
+    "dist",
+    ".eggs",
+    "*.egg",
+]

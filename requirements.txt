@@ -1,0 +1,80 @@
+# ============================================================================
+# AgenticX Core Dependencies (mirror of pyproject.toml [project.dependencies])
+# Source of truth: pyproject.toml — edit there first, then refresh this file.
+#
+# Install (recommended):
+#   pip install -e .
+#   pip install -e ".[desktop-runtime]"   # Near Desktop / agx serve bundle
+#   pip install -e ".[dev]"               # pytest, formatters, etc.
+#
+# Reproducible lock (optional; Near Desktop / agx serve bundle):
+#   uv pip compile pyproject.toml --extra desktop-runtime -o requirements.lock
+#   uv pip install -r requirements.lock
+# ============================================================================
+
+# 基础框架
+pydantic>=2.0.0
+typing-extensions>=4.0.0,<5
+loguru>=0.7.0,<1
+rich>=13.0.0,<14
+click>=8.0.0,<9
+PyYAML>=6.0,<7
+json5>=0.9.25,<1
+tomli>=2.0,<3; python_version<'3.11'
+jinja2>=3.0.0,<4
+python-dotenv>=1.0.0,<2
+
+# 网络 / HTTP
+httpx>=0.25.0,<1
+requests>=2.31.0,<3
+aiohttp>=3.9.0,<4
+aiofiles>=23.0.0,<25
+websockets>=12.0
+
+# Web 框架
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.9,<1
+typer>=0.9.0,<1
+
+# LLM 核心
+openai>=1.50.0,<3
+litellm>=1.50.0,<2
+tiktoken>=0.7.0,<1
+tokenizers>=0.19.0,<1
+huggingface-hub>=0.24.0,<1
+
+# 核心工具库
+docstring-parser>=0.11,<0.16
+
+# 通用工具
+ujson>=5.8.0,<6
+tqdm>=4.65.0,<5
+joblib>=1.3.0,<2
+chardet>=5.0.0,<6
+psutil>=5.9.0,<6
+structlog>=23.1.0,<25
+watchdog>=3.0.0,<5
+
+# ============================================================================
+# Optional extras (install via pyproject.toml optional-dependencies groups)
+# ============================================================================
+#
+# pip install -e ".[llm]"              # anthropic, ollama
+# pip install -e ".[memory]"           # mem0ai, chromadb, qdrant, redis, pymilvus, numpy
+# pip install -e ".[graphiti]"         # Near memory graph (Graphiti + Kuzu)
+# pip install -e ".[document]"         # PyMuPDF, pypdf, python-docx, python-pptx, OCR helpers
+# pip install -e ".[desktop-runtime]"  # chromadb, onnxruntime, mcp, socksio (Desktop / PyInstaller)
+# pip install -e ".[mcp]"              # mcp SDK only
+# pip install -e ".[ocr]"              # easyocr (pulls torch ~2GB)
+# pip install -e ".[graph]"            # networkx, neo4j, cdlib, ...
+# pip install -e ".[data]"             # pandas, numpy, matplotlib, ...
+# pip install -e ".[monitoring]"       # prometheus, opentelemetry
+# pip install -e ".[database]"         # psycopg2, SQLAlchemy
+# pip install -e ".[volcengine]"       # agentkit-sdk-python
+# pip install -e ".[dev]"              # pytest, black, flake8, ...
+# pip install -e ".[docs]"             # mkdocs, mkdocs-material, ...
+# pip install -e ".[all]"              # all feature extras (no dev/docs)
+#
+# Feishu long-connection bot (agx feishu) — not in core deps:
+#   pip install lark-oapi>=1.3.0

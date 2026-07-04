@@ -1,0 +1,1800 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+AgenticX CLI 主程序
+基于 Typer 的命令行工具套件
+"""
+
+import sys
+_SAVED_CLI_ARGV = sys.argv[:]
+
+import difflib
+import os
+import re
+import asyncio
+import click
+import typer
+from typing import Optional, List
+from pathlib import Path
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.panel import Panel
+from typer.core import TyperGroup
+
+from agenticx._version import __version__
+
+
+def _suppress_macos_dock_icon():
+    """Prevent headless server process from showing a dock icon on macOS."""
+    if sys.platform != "darwin":
+        return
+    try:
+        from AppKit import NSApplication
+        NSApplication.sharedApplication().setActivationPolicy_(2)
+        return
+    except ImportError:
+        pass
+    try:
+        import ctypes
+        ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/AppKit.framework/AppKit"
+        )
+        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.objc_msgSend.restype = ctypes.c_void_p
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        ns_app = objc.objc_msgSend(
+            objc.objc_getClass(b"NSApplication"),
+            objc.sel_registerName(b"sharedApplication"),
+        )
+        objc.objc_msgSend.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64,
+        ]
+        objc.objc_msgSend(
+            ns_app, objc.sel_registerName(b"setActivationPolicy:"), 2,
+        )
+    except Exception:
+        pass
+
+
+# 延迟导入函数
+def _get_client():
+    """延迟导入客户端"""
+    try:
+        from agenticx.cli.client import AgenticXClient
+        return AgenticXClient
+    except ImportError:
+        console.print("[bold red]错误:[/bold red] 无法导入 AgenticXClient")
+        raise typer.Exit(1)
+
+def _get_scaffolder():
+    from .scaffold import ProjectScaffolder
+    return ProjectScaffolder
+
+def _get_debug_server():
+    from .debug import DebugServer
+    return DebugServer
+
+def _get_doc_generator():
+    from .docs import DocGenerator
+    return DocGenerator
+
+def _get_deploy_manager():
+    from .deploy import DeployManager
+    return DeployManager
+
+def _get_skills_app():
+    """延迟导入 skills 子应用"""
+    try:
+        from agenticx.cli.skills_commands import skills_app
+        return skills_app
+    except ImportError:
+        console.print("[bold red]错误:[/bold red] 无法导入 skills 模块")
+        raise typer.Exit(1)
+
+
+def _get_hooks_app():
+    """Lazy import hooks sub-application."""
+    try:
+        from agenticx.cli.hooks_commands import hooks_app
+        return hooks_app
+    except ImportError:
+        console.print("[bold red]错误:[/bold red] 无法导入 hooks 模块")
+        raise typer.Exit(1)
+
+
+def _get_config_app():
+    """Lazy import config sub-application."""
+    try:
+        from agenticx.cli.config_commands import config_app
+        return config_app
+    except ImportError:
+        console.print("[bold red]错误:[/bold red] 无法导入 config 模块")
+        raise typer.Exit(1)
+
+
+def _get_cc_bridge_app():
+    """Lazy import cc-bridge sub-application."""
+    try:
+        from agenticx.cli.cc_bridge_commands import cc_bridge_app
+        return cc_bridge_app
+    except ImportError:
+        console.print("[bold red]错误:[/bold red] 无法导入 cc_bridge 模块")
+        raise typer.Exit(1)
+
+
+def _get_generate_app():
+    """Lazy import generate sub-application."""
+    try:
+        from agenticx.cli.generate_commands import generate_app
+        return generate_app
+    except ImportError:
+        console.print("[bold red]错误:[/bold red] 无法导入 generate 模块")
+        raise typer.Exit(1)
+
+class AgenticXGroup(TyperGroup):
+    """Custom group to provide typo suggestions for unknown commands."""
+
+    def resolve_command(self, ctx: click.Context, args: list[str]):
+        try:
+            return super().resolve_command(ctx, args)
+        except click.UsageError as exc:
+            if not args or "No such command" not in str(exc):
+                raise
+
+            cmd_name = args[0]
+            matches = difflib.get_close_matches(
+                cmd_name,
+                self.list_commands(ctx),
+                n=3,
+                cutoff=0.5,
+            )
+            message = f"未知命令: '{cmd_name}'"
+            if matches:
+                suggestions = ", ".join(f"'{m}'" for m in matches)
+                message += f"\n\n你是不是想输入: {suggestions}"
+            message += "\n\n输入 agx --help 查看全部命令"
+            raise click.UsageError(message, ctx=ctx)
+
+
+# 创建主应用
+app = typer.Typer(
+    name="agenticx",
+    help="AgenticX: 统一的多智能体框架 - 开发者工具套件",
+    add_completion=False,
+    invoke_without_command=True,
+    no_args_is_help=False,
+    cls=AgenticXGroup,
+)
+
+# 添加版本回调函数
+def version_callback(value: bool):
+    if value:
+        typer.echo(f"AgenticX {__version__}")
+        raise typer.Exit()
+
+# 添加全局 --version 选项
+# 添加帮助回调函数
+def help_callback(value: bool):
+    """帮助回调函数"""
+    if value:
+        import click
+        ctx = click.get_current_context()
+        click.echo(ctx.get_help())
+        raise typer.Exit()
+
+
+def run_help_callback(value: bool):
+    """run 命令帮助回调函数"""
+    if value:
+        from rich.panel import Panel
+        from rich.table import Table
+        
+        # 创建选项表格
+        options_table = Table(show_header=False, box=None, padding=(0, 1))
+        options_table.add_column("Option", style="cyan")
+        options_table.add_column("Description")
+        options_table.add_row("--config    -c  TEXT", "配置文件路径")
+        options_table.add_row("--verbose   -v", "详细输出")
+        options_table.add_row("--debug     -d", "调试模式")
+        options_table.add_row("--help      -h", "显示帮助信息")
+        
+        console.print("\n[bold yellow]Usage:[/bold yellow] agx run [OPTIONS] FILE\n")
+        console.print("执行工作流文件\n")
+        console.print(Panel(options_table, title="Options", title_align="left"))
+        raise typer.Exit()
+
+
+def validate_help_callback(value: bool):
+    """validate 命令帮助回调函数"""
+    if value:
+        from rich.panel import Panel
+        from rich.table import Table
+        
+        # 创建选项表格
+        options_table = Table(show_header=False, box=None, padding=(0, 1))
+        options_table.add_column("Option", style="cyan")
+        options_table.add_column("Description")
+        options_table.add_row("--schema    -s  TEXT", "验证模式")
+        options_table.add_row("--help      -h", "显示帮助信息")
+        
+        console.print("\n[bold yellow]Usage:[/bold yellow] agx validate [OPTIONS] CONFIG\n")
+        console.print("验证配置文件\n")
+        console.print(Panel(options_table, title="Options", title_align="left"))
+        raise typer.Exit()
+
+
+def test_help_callback(value: bool):
+    """test 命令帮助回调函数"""
+    if value:
+        from rich.panel import Panel
+        from rich.table import Table
+        
+        # 创建选项表格
+        options_table = Table(show_header=False, box=None, padding=(0, 1))
+        options_table.add_column("Option", style="cyan")
+        options_table.add_column("Description")
+        options_table.add_row("--pattern   -p  TEXT", "测试文件匹配模式")
+        options_table.add_row("--verbose   -v", "详细输出")
+        options_table.add_row("--help      -h", "显示帮助信息")
+        
+        console.print("\n[bold yellow]Usage:[/bold yellow] agx test [OPTIONS] [SUITE]\n")
+        console.print("运行测试套件\n")
+        console.print(Panel(options_table, title="Options", title_align="left"))
+        raise typer.Exit()
+
+def _print_welcome() -> None:
+    """Print a concise welcome page with usage hints."""
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Command", style="cyan")
+    table.add_column("Description")
+    table.add_row("agx run <file>", "执行工作流文件")
+    table.add_row("agx project create <name>", "创建新项目")
+    table.add_row("agx agent list", "列出所有智能体")
+    table.add_row("agx skills list", "查看已安装技能")
+    table.add_row("agx serve", "启动 API 服务器")
+
+    console.print(f"\n[bold blue]AgenticX[/bold blue] v{__version__}")
+    console.print("[dim]统一的多智能体框架 - 开发者工具套件[/dim]\n")
+    console.print(Panel(table, title="常用命令", title_align="left", expand=False))
+    console.print("\n[dim]输入 agx --help 查看全部命令[/dim]\n")
+
+
+@app.callback(invoke_without_command=True)
+def main_callback(
+    ctx: typer.Context,
+    version: Optional[bool] = typer.Option(
+        None, "--version", "-v", 
+        callback=version_callback,
+        is_eager=True,
+        help="显示版本信息并退出"
+    ),
+    help_flag: Optional[bool] = typer.Option(
+        None, "--help", "-h",
+        callback=help_callback,
+        is_eager=True,
+        help="显示帮助信息并退出"
+    )
+):
+    """AgenticX: 统一的多智能体框架 - 开发者工具套件"""
+    if ctx.invoked_subcommand is None:
+        _print_welcome()
+
+# 创建子命令组
+project_app = typer.Typer(name="project", help="项目管理命令", no_args_is_help=True)
+agent_app = typer.Typer(name="agent", help="智能体管理命令", no_args_is_help=True)
+workflow_app = typer.Typer(name="workflow", help="工作流管理命令", no_args_is_help=True)
+deploy_app = typer.Typer(name="deploy", help="部署相关命令", no_args_is_help=True)
+monitor_app = typer.Typer(name="monitor", help="监控相关命令", no_args_is_help=True)
+docs_app = typer.Typer(name="docs", help="文档生成命令", no_args_is_help=True)
+mineru_app = typer.Typer(name="mineru", help="MinerU 文档解析命令", no_args_is_help=True)
+
+# 导入 tools 子应用
+def _get_tools_app():
+    """延迟导入 tools 子应用"""
+    try:
+        from agenticx.cli.tools import tools_app
+        return tools_app
+    except ImportError:
+        console.print("[bold red]错误:[/bold red] 无法导入 tools 模块")
+        raise typer.Exit(1)
+
+
+def _safe_python_filename(name: str) -> str:
+    """Convert user-provided name into a safe Python filename stem."""
+    normalized = re.sub(r"[^a-zA-Z0-9_-]+", "_", name.strip().lower())
+    normalized = normalized.strip("._-")
+    if not normalized:
+        raise ValueError("名称不能为空")
+    return normalized.replace("-", "_")
+
+@project_app.callback(invoke_without_command=True)
+def project_callback(
+    ctx: typer.Context,
+    help_flag: bool = typer.Option(
+        False, "-h", "--help", 
+        help="显示帮助信息"
+    )
+):
+    """项目管理命令回调函数，支持 -h 选项"""
+    if help_flag or ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
+
+
+@agent_app.callback(invoke_without_command=True)
+def agent_callback(
+    ctx: typer.Context,
+    help_flag: bool = typer.Option(
+        False, "-h", "--help", 
+        help="显示帮助信息"
+    )
+):
+    """智能体管理命令回调函数，支持 -h 选项"""
+    if help_flag or ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
+
+
+@workflow_app.callback(invoke_without_command=True)
+def workflow_callback(
+    ctx: typer.Context,
+    help_flag: bool = typer.Option(
+        False, "-h", "--help", 
+        help="显示帮助信息"
+    )
+):
+    """工作流管理命令回调函数，支持 -h 选项"""
+    if help_flag or ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
+
+
+@deploy_app.callback(invoke_without_command=True)
+def deploy_callback(
+    ctx: typer.Context,
+    help_flag: bool = typer.Option(
+        False, "-h", "--help", 
+        help="显示帮助信息"
+    )
+):
+    """部署相关命令回调函数，支持 -h 选项"""
+    if help_flag or ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
+
+
+@monitor_app.callback(invoke_without_command=True)
+def monitor_callback(
+    ctx: typer.Context,
+    help_flag: bool = typer.Option(
+        False, "-h", "--help", 
+        help="显示帮助信息"
+    )
+):
+    """监控相关命令回调函数，支持 -h 选项"""
+    if help_flag or ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
+
+
+@docs_app.callback(invoke_without_command=True)
+def docs_callback(
+    ctx: typer.Context,
+    help_flag: bool = typer.Option(
+        False, "-h", "--help", 
+        help="显示帮助信息"
+    )
+):
+    """文档命令回调函数，支持 -h 选项"""
+    if help_flag or ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
+
+# 注册子命令
+app.add_typer(project_app)
+app.add_typer(agent_app)
+app.add_typer(workflow_app)
+app.add_typer(deploy_app)
+app.add_typer(monitor_app)
+app.add_typer(docs_app)
+app.add_typer(mineru_app)
+
+# 注册 tools 子命令 (延迟加载)
+try:
+    tools_app = _get_tools_app()
+    app.add_typer(tools_app)
+except Exception:
+    # 如果 tools 模块加载失败，不影响其他功能
+    pass
+
+# 注册 skills 子命令 (延迟加载)
+try:
+    skills_app = _get_skills_app()
+    app.add_typer(skills_app)
+except Exception:
+    pass
+
+# 注册 hooks 子命令 (延迟加载)
+try:
+    hooks_app = _get_hooks_app()
+    app.add_typer(hooks_app)
+except Exception:
+    pass
+
+# 注册 config 子命令 (延迟加载)
+try:
+    config_app = _get_config_app()
+    app.add_typer(config_app)
+except Exception:
+    pass
+
+# 注册 cc-bridge 子命令 (延迟加载)
+try:
+    cc_bridge_app = _get_cc_bridge_app()
+    app.add_typer(cc_bridge_app)
+except Exception:
+    pass
+
+# 注册 memory-graph 子命令 (延迟加载)
+try:
+    from agenticx.cli.memory_graph_commands import memory_graph_app
+
+    app.add_typer(memory_graph_app)
+except Exception:
+    pass
+
+# 注册 generate 子命令 (延迟加载)
+try:
+    generate_app = _get_generate_app()
+    app.add_typer(generate_app)
+except Exception:
+    pass
+
+# 注册 volcengine 子命令 (延迟加载)
+try:
+    from agenticx.cli.volcengine_commands import volcengine_app
+    app.add_typer(volcengine_app)
+except Exception:
+    pass
+
+console = Console()
+
+sandbox_app = typer.Typer(name="sandbox", help="沙箱管理", no_args_is_help=True)
+
+
+@sandbox_app.callback(invoke_without_command=True)
+def sandbox_callback(
+    ctx: typer.Context,
+    help_flag: bool = typer.Option(False, "-h", "--help", help="显示帮助信息"),
+):
+    """沙箱子命令：查看后端可用性与自动选择结果。"""
+    if help_flag or ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
+
+
+@sandbox_app.command("status")
+def sandbox_status():
+    """显示沙箱后端可用性与当前 auto 选择结果。"""
+    import os
+
+    from agenticx.sandbox.base import Sandbox
+
+    console.print("\n[bold]AgenticX Sandbox Status[/bold]\n")
+
+    table = Table(title="Backend Availability")
+    table.add_column("Mode", style="cyan")
+    table.add_column("Backend", style="green")
+    table.add_column("Available", style="bold")
+    table.add_column("Note")
+
+    table.add_row("Local", "subprocess", "Yes", "进程级隔离，仅限开发")
+
+    docker_ok = Sandbox._is_docker_available()
+    table.add_row(
+        "Docker",
+        "docker",
+        "Yes" if docker_ok else "No",
+        "容器级隔离",
+    )
+
+    remote_ok = Sandbox._is_remote_available()
+    remote_url = os.environ.get("AGX_SANDBOX_REMOTE_URL", "").strip()
+    if not remote_url:
+        try:
+            from agenticx.cli.config_manager import ConfigManager
+
+            remote_url = (ConfigManager.load().sandbox.remote_url or "").strip()
+        except Exception:
+            remote_url = ""
+    remote_note = f"远端: {remote_url}" if remote_url else "远端: (未设置 AGX_SANDBOX_REMOTE_URL / config sandbox.remote_url)"
+    table.add_row(
+        "Docker+K8s",
+        "remote",
+        "Yes" if remote_ok else "No",
+        remote_note,
+    )
+
+    msb_ok = Sandbox._is_microsandbox_available()
+    table.add_row(
+        "MicroVM",
+        "microsandbox",
+        "Yes" if msb_ok else "No",
+        "硬件级隔离 (VM)",
+    )
+
+    console.print(table)
+
+    auto_backend = Sandbox._select_backend()
+    console.print(f"\n[bold]Auto-selected backend:[/bold] {auto_backend}\n")
+
+
+app.add_typer(sandbox_app)
+
+
+@app.command()
+def version():
+    """显示版本信息"""
+    console.print(f"[bold blue]AgenticX[/bold blue] {__version__}")
+
+
+@app.command()
+def studio(
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="使用的 LLM 厂商"),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="覆盖模型名称"),
+    debug: bool = typer.Option(False, "--debug", "-d", help="调试模式，显示内部日志"),
+):
+    """启动交互式 AGX Studio."""
+    from agenticx.cli.log_config import configure_cli_logging
+    from agenticx.cli.studio import run_studio
+
+    configure_cli_logging(debug=debug)
+    run_studio(provider=provider, model=model)
+
+
+@app.command()
+def serve(
+    port: int = typer.Option(8000, "--port", "-p", help="监听端口"),
+    host: str = typer.Option("0.0.0.0", "--host", help="监听地址"),
+    reload: bool = typer.Option(False, "--reload", help="开发模式热重载"),
+    token: str = typer.Option("", "--token", "-t", help="Desktop 认证 token (覆盖 AGX_DESKTOP_TOKEN)"),
+    gateway: bool = typer.Option(
+        False,
+        "--gateway",
+        help="启用 IM 远程指令网关客户端（需 ~/.agenticx/config.yaml 中 gateway 配置）",
+    ),
+):
+    """启动 Studio FastAPI 服务（SSE 事件流）"""
+    _suppress_macos_dock_icon()
+    try:
+        from agenticx.studio.server import create_studio_app
+        import uvicorn
+    except ImportError as e:
+        console.print(f"[bold red]错误:[/bold red] 缺少依赖，请安装: pip install agenticx\n{e}")
+        raise typer.Exit(1)
+
+    if token:
+        os.environ["AGX_DESKTOP_TOKEN"] = token
+
+    publish_host = "127.0.0.1" if host in ("0.0.0.0", "::", "[::]") else host
+    os.environ["AGX_SERVE_PORT"] = str(port)
+    os.environ["AGX_SERVE_HOST"] = publish_host
+    if gateway:
+        os.environ["AGX_GATEWAY_ENABLED"] = "true"
+
+    effective_token = os.environ.get("AGX_DESKTOP_TOKEN", "").strip()
+
+    # Write port and token to ~/.agenticx/serve.port / serve.token
+    # so sibling processes (e.g. agx feishu) can auto-discover without extra flags.
+    try:
+        base_dir = Path.home() / ".agenticx"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        (base_dir / "serve.port").write_text(str(port))
+        _tok = os.environ.get("AGX_DESKTOP_TOKEN", "").strip()
+        if _tok:
+            (base_dir / "serve.token").write_text(_tok)
+    except Exception:
+        pass
+
+    app_inst = create_studio_app()
+    console.print(f"[bold green]AgenticX Studio Server[/bold green] http://{host}:{port}")
+    if effective_token:
+        masked = effective_token[:8] + "*" * max(0, len(effective_token) - 8)
+        console.print(f"  Token: {masked}")
+    else:
+        console.print("  [yellow]Warning: no token set, API is unauthenticated[/yellow]")
+    if gateway or os.getenv("AGX_GATEWAY_ENABLED", "").strip().lower() in ("1", "true", "yes"):
+        console.print("  [cyan]IM Gateway client:[/cyan] enabled (see ~/.agenticx/config.yaml gateway.*)")
+    console.print("  GET /api/session, POST /api/chat, POST /api/confirm, GET /api/artifacts")
+    uvicorn.run(app_inst, host=host, port=port, reload=reload)
+
+
+@app.command("gateway")
+def gateway_serve(
+    config: str = typer.Option(
+        "gateway_config.yaml",
+        "--config",
+        "-c",
+        help="网关服务 YAML 配置路径",
+    ),
+):
+    """启动 IM Webhook 网关（飞书/企微/钉钉回调与设备 WebSocket 中继）。"""
+    _suppress_macos_dock_icon()
+    try:
+        from pathlib import Path
+
+        from agenticx.gateway.app import run_gateway_server
+    except ImportError as e:
+        console.print(f"[bold red]错误:[/bold red] 无法加载网关模块: {e}")
+        raise typer.Exit(1)
+    cfg_path = Path(config).expanduser()
+    if not cfg_path.is_file():
+        console.print(
+            f"[yellow]提示:[/yellow] 未找到 {cfg_path}，将使用默认空配置。"
+            " 请参考 docs/gateway/im-remote-gateway-setup.md 创建配置。"
+        )
+    run_gateway_server(cfg_path)
+
+
+@app.command("feishu")
+def feishu_longconn(
+    app_id: str = typer.Option(
+        "",
+        "--app-id",
+        help="飞书应用 App ID（优先于环境变量 FEISHU_APP_ID）",
+    ),
+    app_secret: str = typer.Option(
+        "",
+        "--app-secret",
+        help="飞书应用 App Secret（优先于环境变量 FEISHU_APP_SECRET）",
+    ),
+    studio_url: str = typer.Option(
+        "",
+        "--studio-url",
+        help="本机 agx serve 地址，默认 http://127.0.0.1:8000",
+    ),
+    desktop_token: str = typer.Option(
+        "",
+        "--desktop-token",
+        help="agx serve 鉴权 token（如有）",
+    ),
+    debug: bool = typer.Option(False, "--debug", help="开启 DEBUG 日志"),
+):
+    """通过飞书长连接（WebSocket）接收消息并转发给本机 Near 执行。
+
+    无需公网 IP，使用飞书官方 SDK 主动连接飞书服务器。
+
+    配置优先级：命令行参数 > 环境变量（FEISHU_APP_ID / FEISHU_APP_SECRET）
+
+    示例：
+
+        agx feishu --app-id cli_xxx --app-secret yyy
+
+        FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=yyy agx feishu
+    """
+    _suppress_macos_dock_icon()
+
+    import logging as _logging
+    _logging.basicConfig(
+        level=_logging.DEBUG if debug else _logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    resolved_app_id = (app_id or os.environ.get("FEISHU_APP_ID") or "").strip()
+    resolved_app_secret = (app_secret or os.environ.get("FEISHU_APP_SECRET") or "").strip()
+    resolved_studio = (studio_url or os.environ.get("AGX_STUDIO_BASE_URL") or "").strip()
+    resolved_token = (desktop_token or os.environ.get("AGX_DESKTOP_TOKEN") or "").strip()
+
+    if not resolved_app_id or not resolved_app_secret:
+        console.print(
+            "[bold red]错误:[/bold red] 需要提供 --app-id 和 --app-secret，"
+            "或设置环境变量 FEISHU_APP_ID / FEISHU_APP_SECRET。"
+        )
+        raise typer.Exit(1)
+
+    if not resolved_studio:
+        host = os.environ.get("AGX_SERVE_HOST", "127.0.0.1")
+        port = os.environ.get("AGX_SERVE_PORT", "8000")
+        resolved_studio = f"http://{host}:{port}"
+
+    try:
+        from agenticx.gateway.feishu_longconn import FeishuLongConnRunner
+    except ImportError as e:
+        console.print(f"[bold red]错误:[/bold red] 无法加载飞书模块: {e}")
+        console.print("请先安装依赖: [cyan]pip install lark-oapi[/cyan]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]飞书长连接启动中...[/green] app_id={resolved_app_id}")
+    console.print(f"  本机 agx serve: [cyan]{resolved_studio}[/cyan]")
+    console.print("  在飞书里给机器人发消息即可触发 Near 执行。")
+    console.print("  发送「新对话」可重置会话上下文，「状态」可检查连接。")
+
+    runner = FeishuLongConnRunner(
+        app_id=resolved_app_id,
+        app_secret=resolved_app_secret,
+        studio_base_url=resolved_studio,
+        desktop_token=resolved_token,
+        log_level="DEBUG" if debug else "INFO",
+    )
+    runner.run()
+
+
+@app.command()
+def loop(
+    task: str = typer.Argument(..., help="循环执行的任务描述"),
+    max_iterations: int = typer.Option(8, "--max-iterations", help="最大迭代轮数"),
+    completion_promise: str = typer.Option("", "--completion-promise", help="完成标记文本"),
+    provider: Optional[str] = typer.Option(None, "--provider", help="LLM 厂商"),
+    model: Optional[str] = typer.Option(None, "--model", help="模型名称"),
+):
+    """以自引用循环模式执行任务（长程问题优化）"""
+    from agenticx.cli.studio import StudioSession
+    from agenticx.llms.provider_resolver import ProviderResolver
+    from agenticx.runtime import AgentRuntime, SyncConfirmGate
+    from agenticx.runtime.loop_controller import LoopController
+    from agenticx.runtime.meta_tools import META_AGENT_TOOLS
+    from agenticx.runtime.prompts.meta_agent import build_meta_agent_system_prompt
+
+    session = StudioSession(provider_name=provider, model_name=model)
+    llm = ProviderResolver.resolve(provider_name=provider, model=model)
+    runtime = AgentRuntime(llm, SyncConfirmGate())
+    controller = LoopController(
+        max_iterations=max_iterations,
+        completion_promise=completion_promise or None,
+    )
+
+    async def _run() -> str:
+        final = ""
+        async for event in controller.run_loop(
+            task=task,
+            runtime=runtime,
+            session=session,
+            agent_id="meta",
+            tools=META_AGENT_TOOLS,
+            system_prompt=build_meta_agent_system_prompt(session, mode="interactive"),
+        ):
+            if event.type == "token":
+                text = str(event.data.get("text", ""))
+                if text:
+                    console.print(text, end="")
+            if event.type == "final":
+                final = str(event.data.get("text", ""))
+            if event.type == "error":
+                final = str(event.data.get("text", ""))
+        return final
+
+    result = asyncio.run(_run())
+    console.print(f"\n[bold green]Loop 结果:[/bold green] {result}")
+
+
+@app.command()
+def run(
+    file: str = typer.Argument(..., help="要执行的工作流文件"),
+    config: Optional[str] = typer.Option(None, "--config", "-c", help="配置文件路径"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细输出"),
+    debug: bool = typer.Option(False, "--debug", "-d", help="调试模式"),
+    help_flag: bool = typer.Option(False, "--help", "-h", help="显示帮助信息", callback=lambda value: run_help_callback(value) if value else None, is_eager=True)
+):
+    """执行工作流文件"""
+    console.print(f"[bold blue]执行工作流:[/bold blue] {file}")
+    
+    if not os.path.exists(file):
+        console.print(f"[bold red]错误:[/bold red] 文件不存在: {file}")
+        raise typer.Exit(1)
+    
+    # 延迟导入和创建客户端
+    AgenticXClient = _get_client()
+    client = AgenticXClient(config_path=config, verbose=verbose, debug=debug)
+    
+    try:
+        # 执行工作流
+        result = client.run_workflow_file(file)
+        console.print(f"[bold green]执行完成![/bold green]")
+        if verbose:
+            console.print(f"结果: {result}")
+    except Exception as e:
+        console.print(f"[bold red]执行失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def validate(
+    config: str = typer.Argument(..., help="要验证的配置文件"),
+    schema: Optional[str] = typer.Option(None, "--schema", "-s", help="验证模式"),
+    help_flag: bool = typer.Option(False, "--help", "-h", help="显示帮助信息", callback=lambda value: validate_help_callback(value) if value else None, is_eager=True)
+):
+    """验证配置文件"""
+    console.print(f"[bold blue]验证配置文件:[/bold blue] {config}")
+    
+    if not os.path.exists(config):
+        console.print(f"[bold red]错误:[/bold red] 配置文件不存在: {config}")
+        raise typer.Exit(1)
+    
+    AgenticXClient = _get_client()
+    client = AgenticXClient()
+    try:
+        result = client.validate_config(config, schema)
+        if result.is_valid:
+            console.print(f"[bold green]✓ 配置文件验证通过![/bold green]")
+        else:
+            console.print(f"[bold red]✗ 配置文件验证失败:[/bold red]")
+            for error in result.errors:
+                console.print(f"  - {error}")
+            raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[bold red]验证失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def test(
+    suite: Optional[str] = typer.Argument(None, help="测试套件名称"),
+    pattern: Optional[str] = typer.Option(None, "--pattern", "-p", help="测试文件匹配模式"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细输出"),
+    help_flag: bool = typer.Option(False, "--help", "-h", help="显示帮助信息", callback=lambda value: test_help_callback(value) if value else None, is_eager=True)
+):
+    """运行测试套件"""
+    console.print(f"[bold blue]运行测试套件:[/bold blue] {suite or '所有测试'}")
+    
+    AgenticXClient = _get_client()
+    client = AgenticXClient()
+    try:
+        result = client.run_tests(suite, pattern, verbose)
+        if result.success:
+            console.print(f"[bold green]✓ 测试通过![/bold green]")
+            console.print(f"执行: {result.tests_run}个测试, 失败: {result.failures}个")
+        else:
+            console.print(f"[bold red]✗ 测试失败![/bold red]")
+            for failure in result.failure_details:
+                console.print(f"  - {failure}")
+            raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[bold red]测试失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+# === 项目管理命令 ===
+@project_app.command("create")
+def create_project(
+    name: str = typer.Argument(..., help="项目名称"),
+    template: str = typer.Option("basic", "--template", "-t", help="项目模板"),
+    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="项目目录"),
+    ai: Optional[str] = typer.Option(None, "--ai", help="使用 AI 描述自动生成核心代码"),
+    provider: Optional[str] = typer.Option(None, "--provider", help="AI 生成使用的 LLM 厂商"),
+    model: Optional[str] = typer.Option(None, "--model", help="AI 生成覆盖模型"),
+):
+    """创建新项目"""
+    console.print(f"[bold blue]创建项目:[/bold blue] {name}")
+    
+    ProjectScaffolder = _get_scaffolder()
+    scaffolder = ProjectScaffolder()
+    try:
+        project_path = scaffolder.create_project(name, template, directory)
+        console.print(f"[bold green]✓ 项目创建成功![/bold green]")
+        console.print(f"项目路径: {project_path}")
+        if ai:
+            from agenticx.cli.codegen_engine import CodeGenEngine
+            from agenticx.llms.provider_resolver import ProviderResolver
+
+            llm = ProviderResolver.resolve(provider_name=provider, model=model)
+            engine = CodeGenEngine(llm)
+            agent_artifact = engine.generate("agent", ai, {"project_name": name})
+            workflow_artifact = engine.generate("workflow", ai, {"project_name": name})
+
+            root = Path(project_path)
+            (root / "agents").mkdir(exist_ok=True)
+            (root / "workflows").mkdir(exist_ok=True)
+            (root / "agents" / "ai_generated_agent.py").write_text(
+                agent_artifact.code, encoding="utf-8"
+            )
+            (root / "workflows" / "ai_generated_workflow.py").write_text(
+                workflow_artifact.code, encoding="utf-8"
+            )
+            console.print("[bold green]✓ AI 增强内容已生成[/bold green]")
+    except Exception as e:
+        console.print(f"[bold red]项目创建失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@project_app.command("info")
+def project_info():
+    """显示项目信息"""
+    console.print("[bold blue]项目信息:[/bold blue]")
+    
+    # 检查是否在项目目录中
+    if not os.path.exists("config.yaml"):
+        console.print("[yellow]当前目录不是 AgenticX 项目[/yellow]")
+        return
+    
+    # 显示项目信息
+    console.print("✓ 这是一个 AgenticX 项目")
+
+
+@project_app.command("status")
+def project_status_cmd(
+    workspace: Optional[str] = typer.Option(
+        None,
+        "--workspace",
+        "-w",
+        help="Workspace root containing .agx/project (defaults to cwd).",
+    ),
+    progress_tail: int = typer.Option(
+        20,
+        "--progress-tail",
+        "-n",
+        help="Number of progress.md tail lines to render (0-200).",
+    ),
+) -> None:
+    """从磁盘读取 .agx/project/ 状态（项目级 Harness）。"""
+    from pathlib import Path as _Path
+
+    from agenticx.project_state.feature_list import summarize as _summarize
+    from agenticx.project_state.store import (
+        ProjectStateError as _PSError,
+        ProjectStore as _Store,
+    )
+
+    root = _Path(workspace).expanduser().resolve() if workspace else _Path.cwd()
+    try:
+        store = _Store.open(root)
+        status = store.load_status()
+        feature_list = store.load_feature_list()
+    except _PSError as exc:
+        console.print(f"[red]未找到项目状态:[/red] {exc}")
+        console.print(
+            "[yellow]提示:[/yellow] 在 feature_loop 模式下让 agent 调用 project_init 完成奠基。"
+        )
+        raise typer.Exit(code=1)
+
+    counts = _summarize(feature_list)
+    console.print(f"[bold]project_id:[/bold] {status.project_id or '(unknown)'}")
+    console.print(f"[bold]root:[/bold] {store.root}")
+    console.print(f"[bold]phase:[/bold] {status.phase}")
+    if status.active_feature_id:
+        console.print(f"[bold]active feature:[/bold] {status.active_feature_id}")
+    console.print(
+        f"[bold]progress:[/bold] verified {counts['verified']}/{counts['total']}, "
+        f"committed {counts['committed']}, pending {counts['pending']}, "
+        f"in_progress {counts['in_progress']}"
+    )
+    console.print(
+        f"[bold]verify:[/bold] pass {status.verify_pass_count} / fail {status.verify_fail_count}"
+    )
+    if status.last_commit_sha:
+        console.print(f"[bold]last commit:[/bold] {status.last_commit_sha[:12]}")
+
+    tail = max(0, min(200, int(progress_tail)))
+    if tail > 0:
+        lines = store.read_progress_tail(tail)
+        if lines:
+            console.print("\n[bold]progress.md (tail)[/bold]")
+            for ln in lines:
+                console.print(f"  {ln}")
+
+
+@project_app.command("resume")
+def project_resume(
+    workspace: Optional[str] = typer.Option(
+        None,
+        "--workspace",
+        "-w",
+        help="Workspace root containing .agx/project (defaults to cwd).",
+    ),
+) -> None:
+    """从磁盘单一事实源重建项目级会话上下文（无需历史 SQLite）。
+
+    打印冷启动 recipe：让用户/Studio 在新建 feature_loop session 时直接
+    调用 ``project_status`` 与 ``feature_select`` 即可恢复到上次离开的位置。
+    """
+    from pathlib import Path as _Path
+
+    from agenticx.project_state.feature_list import (
+        find_feature as _find,
+        select_next_pending as _next,
+        summarize as _summarize,
+    )
+    from agenticx.project_state.store import (
+        ProjectStateError as _PSError,
+        ProjectStore as _Store,
+    )
+
+    root = _Path(workspace).expanduser().resolve() if workspace else _Path.cwd()
+    try:
+        store = _Store.open(root)
+        status = store.load_status()
+        feature_list = store.load_feature_list()
+    except _PSError as exc:
+        console.print(f"[red]无法 resume:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    counts = _summarize(feature_list)
+    console.print("[bold cyan]Project Resume Recipe[/bold cyan]")
+    console.print(f"workspace_root: {root}")
+    console.print(f"project_root:   {store.root}")
+    console.print(f"project_id:     {status.project_id or '(unknown)'}")
+    console.print(f"phase:          {status.phase}")
+    console.print(
+        f"counts:         verified {counts['verified']}/{counts['total']} "
+        f"(pending {counts['pending']}, in_progress {counts['in_progress']}, committed {counts['committed']})"
+    )
+
+    active = _find(feature_list, status.active_feature_id or "")
+    if active is not None:
+        console.print(f"\n[bold]Active feature already in flight:[/bold] {active.id} — {active.title}")
+        console.print(f"  status: {active.status}")
+    else:
+        nxt = _next(feature_list)
+        if nxt is None:
+            console.print("\n[yellow]没有 pending 且依赖满足的 feature；可能已完成或需新增 deliverable。[/yellow]")
+        else:
+            console.print(f"\n[bold]Next pending pickup:[/bold] {nxt.id} — {nxt.title}")
+            ac = "; ".join((nxt.acceptance_criteria or [])[:3]) or "(no criteria)"
+            console.print(f"  acceptance: {ac}")
+
+    console.print(
+        "\n[bold]How to resume in a new session:[/bold]\n"
+        "  1. Open Near (or `agx serve` + Desktop) and start a session with mode=feature_loop in this workspace.\n"
+        "  2. Send a single user message asking to continue. The system prompt block will already include the on-disk state.\n"
+        "  3. The agent must first call `project_status` (single source of truth on disk).\n"
+        "  4. Then `feature_select` (auto picks the right feature) → code_dev loop → `verify_run` → git commit → `feature_complete`.\n"
+        "  5. No SQLite or message history is required to resume — only .agx/project/ on disk.\n"
+    )
+
+
+# === 智能体管理命令 ===
+@agent_app.command("create")
+def create_agent(
+    name: str = typer.Argument(..., help="智能体名称"),
+    role: str = typer.Option("Assistant", "--role", "-r", help="智能体角色"),
+    template: str = typer.Option("basic", "--template", "-t", help="智能体模板"),
+    interactive: bool = typer.Option(False, "--interactive", "-i", help="交互式创建"),
+    ai: Optional[str] = typer.Option(None, "--ai", help="使用 AI 描述自动生成智能体"),
+    provider: Optional[str] = typer.Option(None, "--provider", help="AI 生成使用的 LLM 厂商"),
+    model: Optional[str] = typer.Option(None, "--model", help="AI 生成覆盖模型"),
+):
+    """创建新的智能体"""
+    console.print(f"[bold blue]创建智能体:[/bold blue] {name}")
+    
+    ProjectScaffolder = _get_scaffolder()
+    scaffolder = ProjectScaffolder()
+    try:
+        if ai:
+            from agenticx.cli.codegen_engine import CodeGenEngine
+            from agenticx.llms.provider_resolver import ProviderResolver
+
+            llm = ProviderResolver.resolve(provider_name=provider, model=model)
+            engine = CodeGenEngine(llm)
+            generated = engine.generate(
+                "agent",
+                ai,
+                {"agent_name": name, "role": role, "template": template},
+            )
+            agents_dir = Path("agents")
+            agents_dir.mkdir(exist_ok=True)
+            safe_stem = _safe_python_filename(name)
+            agent_file = agents_dir / f"{safe_stem}.py"
+            agents_root = agents_dir.resolve()
+            file_resolved = agent_file.resolve()
+            if agents_root not in file_resolved.parents and file_resolved != agents_root:
+                raise ValueError("非法文件路径")
+            agent_file.write_text(generated.code, encoding="utf-8")
+            agent_path = str(agent_file)
+        else:
+            agent_path = scaffolder.create_agent(name, role, template, interactive)
+        console.print(f"[bold green]✓ 智能体创建成功![/bold green]")
+        console.print(f"智能体文件: {agent_path}")
+    except Exception as e:
+        console.print(f"[bold red]智能体创建失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@agent_app.command("list")
+def list_agents():
+    """列出当前项目的智能体"""
+    console.print("[bold blue]当前项目的智能体:[/bold blue]")
+    
+    AgenticXClient = _get_client()
+    client = AgenticXClient()
+    try:
+        agents = client.list_agents()
+        
+        if not agents:
+            console.print("[yellow]当前项目没有智能体[/yellow]")
+            return
+            
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("智能体ID", style="cyan")
+        table.add_column("名称", style="white")
+        table.add_column("角色", style="yellow")
+        table.add_column("状态", style="green")
+        
+        for agent in agents:
+            table.add_row(agent.id, agent.name, agent.role, agent.status)
+        
+        console.print(table)
+    except Exception as e:
+        console.print(f"[bold red]获取智能体列表失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+# === 工作流管理命令 ===
+@workflow_app.command("create")
+def create_workflow(
+    name: str = typer.Argument(..., help="工作流名称"),
+    template: str = typer.Option("sequential", "--template", "-t", help="工作流模板"),
+    agents: Optional[str] = typer.Option(None, "--agents", "-a", help="智能体列表(逗号分隔)"),
+    interactive: bool = typer.Option(False, "--interactive", "-i", help="交互式创建")
+):
+    """创建新的工作流"""
+    console.print(f"[bold blue]创建工作流:[/bold blue] {name}")
+    
+    ProjectScaffolder = _get_scaffolder()
+    scaffolder = ProjectScaffolder()
+    try:
+        workflow_path = scaffolder.create_workflow(name, template, interactive)
+        console.print(f"[bold green]✓ 工作流创建成功![/bold green]")
+        console.print(f"工作流文件: {workflow_path}")
+    except Exception as e:
+        console.print(f"[bold red]工作流创建失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@workflow_app.command("list")
+def list_workflows():
+    """列出当前项目的工作流"""
+    console.print("[bold blue]当前项目的工作流:[/bold blue]")
+    
+    AgenticXClient = _get_client()
+    client = AgenticXClient()
+    try:
+        workflows = client.list_workflows()
+        
+        if not workflows:
+            console.print("[yellow]当前项目没有工作流[/yellow]")
+            return
+            
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("工作流ID", style="cyan")
+        table.add_column("名称", style="white")
+        table.add_column("类型", style="yellow")
+        table.add_column("状态", style="green")
+        
+        for workflow in workflows:
+            table.add_row(workflow.id, workflow.name, str(workflow.node_count), workflow.status)
+        
+        console.print(table)
+    except Exception as e:
+        console.print(f"[bold red]获取工作流列表失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+# === 部署相关命令 ===
+@deploy_app.command("prepare")
+def prepare_deploy(
+    target: str = typer.Argument(..., help="部署目标目录"),
+    platform: str = typer.Option("docker", "--platform", "-p", help="部署平台"),
+    config: Optional[str] = typer.Option(None, "--config", "-c", help="部署配置文件")
+):
+    """准备部署包"""
+    console.print(f"[bold blue]准备部署:[/bold blue] {target}")
+    
+    DeployManager = _get_deploy_manager()
+    deploy_manager = DeployManager()
+    try:
+        deploy_path = deploy_manager.prepare_deployment(target, platform, config)
+        console.print(f"[bold green]✓ 部署包准备完成![/bold green]")
+        console.print(f"部署目录: {deploy_path}")
+    except Exception as e:
+        console.print(f"[bold red]部署准备失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@deploy_app.command("docker")
+def deploy_docker(
+    target: str = typer.Argument(..., help="部署目标目录"),
+    tag: str = typer.Option("latest", "--tag", "-t", help="Docker 镜像标签"),
+    push: bool = typer.Option(False, "--push", "-p", help="是否推送到远程仓库")
+):
+    """Docker 部署"""
+    console.print(f"[bold blue]Docker 部署:[/bold blue] {target}")
+    
+    DeployManager = _get_deploy_manager()
+    deploy_manager = DeployManager()
+    try:
+        result = deploy_manager.deploy_docker(target, tag, push)
+        console.print(f"[bold green]✓ Docker 部署完成![/bold green]")
+        if push:
+            console.print(f"镜像已推送: {result}")
+    except Exception as e:
+        console.print(f"[bold red]Docker 部署失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@deploy_app.command("k8s")
+def deploy_kubernetes(
+    target: str = typer.Argument(..., help="部署目标目录"),
+    namespace: str = typer.Option("default", "--namespace", "-n", help="Kubernetes 命名空间"),
+    apply: bool = typer.Option(False, "--apply", "-a", help="是否直接应用到集群")
+):
+    """Kubernetes 部署"""
+    console.print(f"[bold blue]Kubernetes 部署:[/bold blue] {target}")
+    
+    DeployManager = _get_deploy_manager()
+    deploy_manager = DeployManager()
+    try:
+        result = deploy_manager.deploy_kubernetes(namespace)  # 修复参数
+        console.print(f"[bold green]✓ Kubernetes 部署完成![/bold green]")
+        if apply:
+            console.print(f"应用已部署到命名空间: {result}")
+    except Exception as e:
+        console.print(f"[bold red]Kubernetes 部署失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+# === 监控相关命令 ===
+@monitor_app.command("start")
+def start_monitor(
+    port: int = typer.Option(8080, "--port", "-p", help="监控端口"),
+    host: str = typer.Option("0.0.0.0", "--host", "-h", help="监控地址")
+):
+    """启动监控服务"""
+    console.print(f"[bold blue]启动监控服务:[/bold blue] {host}:{port}")
+    
+    DebugServer = _get_debug_server()
+    debug_server = DebugServer()
+    try:
+        debug_server.start_monitoring(host, port)  # 修复方法名
+        console.print(f"[bold green]✓ 监控服务启动成功![/bold green]")
+        console.print(f"访问地址: http://{host}:{port}")
+    except Exception as e:
+        console.print(f"[bold red]监控服务启动失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@monitor_app.command("status")
+def monitor_status():
+    """查看监控状态"""
+    console.print("[bold blue]监控状态:[/bold blue]")
+    
+    DebugServer = _get_debug_server()
+    debug_server = DebugServer()
+    try:
+        # 修复方法调用
+        if debug_server.is_running:
+            console.print("服务状态: 运行中")
+        else:
+            console.print("服务状态: 已停止")
+        console.print(f"运行时间: 未知")  # 简化实现
+        console.print(f"请求数: 未知")    # 简化实现
+    except Exception as e:
+        console.print(f"[bold red]获取状态失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+# === 文档生成命令 ===
+@docs_app.command("generate")
+def generate_docs(
+    output_dir: Optional[str] = typer.Option(
+        None, "--output-dir", "-o", 
+        help="指定文档生成的输出目录，如果不指定则使用项目根目录下的 site 目录"
+    ),
+    help_flag: bool = typer.Option(
+        False, "-h", "--help",
+        help="显示帮助信息"
+    )
+):
+    """生成文档"""
+    if help_flag:
+        from rich.panel import Panel
+        from rich.table import Table
+        
+        # 创建选项表格
+        options_table = Table(show_header=False, box=None, padding=(0, 1))
+        options_table.add_column("Option", style="cyan")
+        options_table.add_column("Description")
+        options_table.add_row("--output-dir  -o  TEXT", "指定文档生成的输出目录，如果不指定则使用项目根目录下的 site 目录")
+        options_table.add_row("--help        -h", "显示帮助信息")
+        
+        console.print("\n[bold yellow]Usage:[/bold yellow] agx docs generate [OPTIONS]\n")
+        console.print("生成文档\n")
+        console.print(Panel(options_table, title="Options", title_align="left"))
+        raise typer.Exit()
+    
+    DocGenerator = _get_doc_generator()
+    doc_generator = DocGenerator(output_dir=output_dir)
+    try:
+        doc_path = doc_generator.generate_docs()
+    except Exception as e:
+        console.print(f"[bold red]❌ 文档生成失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@docs_app.command("serve")
+def serve_docs(
+    port: int = typer.Option(8000, "--port", "-p", help="服务端口"),
+    help_flag: bool = typer.Option(
+        False, "-h", "--help",
+        help="显示帮助信息"
+    )
+):
+    """启动文档服务器"""
+    if help_flag:
+        from rich.panel import Panel
+        from rich.table import Table
+        
+        # 创建选项表格
+        options_table = Table(show_header=False, box=None, padding=(0, 1))
+        options_table.add_column("Option", style="cyan")
+        options_table.add_column("Description")
+        options_table.add_row("--port  -p  INTEGER", "服务端口 [default: 8000]")
+        options_table.add_row("--help  -h", "显示帮助信息")
+        
+        console.print("\n[bold yellow]Usage:[/bold yellow] agx docs serve [OPTIONS]\n")
+        console.print("启动文档服务器\n")
+        console.print(Panel(options_table, title="Options", title_align="left"))
+        raise typer.Exit()
+    
+    console.print(f"[bold blue]启动文档服务器:[/bold blue]")
+    
+    DocGenerator = _get_doc_generator()
+    doc_generator = DocGenerator()
+    try:
+        doc_generator.serve_docs(port=port)
+        console.print(f"[bold green]✓ 文档服务器启动成功![/bold green]")
+        console.print(f"访问地址: http://localhost:{port}")
+    except Exception as e:
+        console.print(f"[bold red]文档服务器启动失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@mineru_app.callback(invoke_without_command=True)
+def mineru_callback(
+    ctx: typer.Context,
+    help_flag: bool = typer.Option(
+        False, "-h", "--help", 
+        help="显示帮助信息"
+    )
+):
+    """MinerU 文档解析命令回调函数，支持 -h 选项"""
+    if help_flag or ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
+
+
+# ==================== MinerU 命令实现 ====================
+
+@mineru_app.command("parse")
+def mineru_parse(
+    files: List[str] = typer.Argument(..., help="要解析的文档文件路径"),
+    output_dir: Optional[str] = typer.Option(None, "--output", "-o", help="输出目录"),
+    mode: str = typer.Option("local", "--mode", "-m", help="解析模式: local, remote_api, remote_mcp"),
+    language: str = typer.Option("auto", "--language", "-l", help="OCR 语言"),
+    api_base: Optional[str] = typer.Option(None, "--api-base", help="远程 API 基础 URL"),
+    api_token: Optional[str] = typer.Option(None, "--api-token", help="远程 API 令牌"),
+    backend: str = typer.Option("PIPELINE", "--backend", "-b", help="后端类型: PIPELINE, VLM_HTTP"),
+    enable_formula: bool = typer.Option(True, "--formula/--no-formula", help="启用公式识别"),
+    enable_table: bool = typer.Option(True, "--table/--no-table", help="启用表格识别"),
+    page_ranges: Optional[str] = typer.Option(None, "--pages", "-p", help="页面范围，如 '1-5,10,15-20'"),
+    config: Optional[str] = typer.Option(None, "--config", "-c", help="配置文件路径"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细输出")
+):
+    """解析文档文件（PDF、PPT、DOC等）并转换为结构化格式"""
+    
+    console.print(f"[bold blue]MinerU 文档解析[/bold blue]")
+    console.print(f"模式: {mode}")
+    console.print(f"文件数量: {len(files)}")
+    
+    # 验证文件存在
+    missing_files = []
+    for file_path in files:
+        if not Path(file_path).exists():
+            missing_files.append(file_path)
+    
+    if missing_files:
+        console.print(f"[bold red]错误:[/bold red] 以下文件不存在:")
+        for file_path in missing_files:
+            console.print(f"  - {file_path}")
+        raise typer.Exit(1)
+    
+    # 设置输出目录
+    if not output_dir:
+        output_dir = Path.cwd() / "mineru_outputs"
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # 导入并执行解析
+        result = asyncio.run(_run_mineru_parse(
+            files=files,
+            output_dir=str(output_path),
+            mode=mode,
+            language=language,
+            api_base=api_base,
+            api_token=api_token,
+            backend=backend,
+            enable_formula=enable_formula,
+            enable_table=enable_table,
+            page_ranges=page_ranges,
+            config=config,
+            verbose=verbose
+        ))
+        
+        # 显示结果
+        _display_parse_results(result, verbose)
+        
+    except Exception as e:
+        console.print(f"[bold red]解析失败:[/bold red] {e}")
+        if verbose:
+            import traceback
+            console.print(traceback.format_exc())
+        raise typer.Exit(1)
+
+
+@mineru_app.command("batch")
+def mineru_batch(
+    input_dir: str = typer.Argument(..., help="输入目录路径"),
+    output_dir: Optional[str] = typer.Option(None, "--output", "-o", help="输出目录"),
+    patterns: Optional[str] = typer.Option("*.pdf,*.png,*.jpg,*.jpeg", "--patterns", help="文件匹配模式（逗号分隔）"),
+    mode: str = typer.Option("local", "--mode", "-m", help="解析模式: local, remote_api"),
+    language: str = typer.Option("auto", "--language", "-l", help="OCR 语言"),
+    api_base: Optional[str] = typer.Option(None, "--api-base", help="远程 API 基础 URL"),
+    api_token: Optional[str] = typer.Option(None, "--api-token", help="远程 API 令牌"),
+    backend: str = typer.Option("PIPELINE", "--backend", "-b", help="后端类型: PIPELINE, VLM_HTTP"),
+    enable_formula: bool = typer.Option(True, "--formula/--no-formula", help="启用公式识别"),
+    enable_table: bool = typer.Option(True, "--table/--no-table", help="启用表格识别"),
+    max_concurrent: int = typer.Option(3, "--max-concurrent", help="最大并发数"),
+    config: Optional[str] = typer.Option(None, "--config", "-c", help="配置文件路径"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细输出")
+):
+    """批量处理目录中的文档文件"""
+    
+    console.print(f"[bold blue]MinerU 批量文档解析[/bold blue]")
+    
+    # 验证输入目录
+    input_path = Path(input_dir)
+    if not input_path.exists():
+        console.print(f"[bold red]错误:[/bold red] 输入目录不存在: {input_dir}")
+        raise typer.Exit(1)
+    
+    if not input_path.is_dir():
+        console.print(f"[bold red]错误:[/bold red] 输入路径不是目录: {input_dir}")
+        raise typer.Exit(1)
+    
+    # 设置输出目录
+    if not output_dir:
+        output_dir = input_path / "mineru_batch_outputs"
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # 执行批量处理
+        result = asyncio.run(_run_mineru_batch(
+            input_dir=str(input_path),
+            output_dir=str(output_path),
+            patterns=patterns.split(",") if patterns else ["*.pdf", "*.png", "*.jpg", "*.jpeg"],
+            mode=mode,
+            language=language,
+            api_base=api_base,
+            api_token=api_token,
+            backend=backend,
+            enable_formula=enable_formula,
+            enable_table=enable_table,
+            max_concurrent=max_concurrent,
+            config=config,
+            verbose=verbose
+        ))
+        
+        # 显示结果
+        _display_batch_results(result, verbose)
+        
+    except Exception as e:
+        console.print(f"[bold red]批量处理失败:[/bold red] {e}")
+        if verbose:
+            import traceback
+            console.print(traceback.format_exc())
+        raise typer.Exit(1)
+
+
+@mineru_app.command("languages")
+def mineru_languages(
+    mode: str = typer.Option("local", "--mode", "-m", help="查询模式: local, remote_api"),
+    api_base: Optional[str] = typer.Option(None, "--api-base", help="远程 API 基础 URL"),
+    api_token: Optional[str] = typer.Option(None, "--api-token", help="远程 API 令牌"),
+    config: Optional[str] = typer.Option(None, "--config", "-c", help="配置文件路径")
+):
+    """获取支持的 OCR 语言列表"""
+    
+    console.print(f"[bold blue]MinerU 支持的 OCR 语言[/bold blue]")
+    
+    try:
+        # 执行语言查询
+        result = asyncio.run(_run_mineru_languages(
+            mode=mode,
+            api_base=api_base,
+            api_token=api_token,
+            config=config
+        ))
+        
+        # 显示结果
+        _display_languages_results(result)
+        
+    except Exception as e:
+        console.print(f"[bold red]语言查询失败:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+# ==================== MinerU 辅助函数 ====================
+
+async def _run_mineru_parse(**kwargs) -> dict:
+    """执行 MinerU 解析"""
+    from agenticx.tools.mineru import ParseDocumentsTool, MinerUParseArgs, ParseMode
+    
+    # 构建参数
+    mode_map = {
+        "local": ParseMode.LOCAL,
+        "remote_api": ParseMode.REMOTE_API,
+        "remote_mcp": ParseMode.REMOTE_MCP
+    }
+    
+    args = MinerUParseArgs(
+        file_sources=kwargs["files"],
+        mode=mode_map.get(kwargs["mode"], ParseMode.LOCAL),
+        language=kwargs["language"],
+        api_base=kwargs.get("api_base"),
+        api_token=kwargs.get("api_token"),
+        backend=kwargs["backend"],
+        enable_formula=kwargs["enable_formula"],
+        enable_table=kwargs["enable_table"],
+        page_ranges=kwargs.get("page_ranges")
+    )
+    
+    # 创建工具并执行
+    config = _load_mineru_config(kwargs.get("config"))
+    tool = ParseDocumentsTool(config)
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("解析文档中...", total=len(kwargs["files"]))
+        
+        result = await tool.parse(args)
+        progress.update(task, completed=len(kwargs["files"]))
+    
+    return result
+
+
+async def _run_mineru_batch(**kwargs) -> dict:
+    """执行 MinerU 批量处理"""
+    from agenticx.tools.remote import MinerUBatchProcessor
+    
+    # 加载配置
+    config = _load_mineru_config(kwargs.get("config"))
+    processor = MinerUBatchProcessor(config)
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("批量处理中...", total=None)
+        
+        result = await processor.process_directory(
+            input_dir=kwargs["input_dir"],
+            output_dir=kwargs["output_dir"],
+            file_patterns=kwargs["patterns"],
+            language=kwargs["language"],
+            enable_formula=kwargs["enable_formula"],
+            enable_table=kwargs["enable_table"]
+        )
+        
+        progress.update(task, completed=1)
+    
+    return result
+
+
+async def _run_mineru_languages(**kwargs) -> dict:
+    """执行 MinerU 语言查询"""
+    from agenticx.tools.mineru import GetOCRLanguagesTool, MinerUOCRLanguagesArgs, ParseMode
+    
+    # 构建参数
+    mode_map = {
+        "local": ParseMode.LOCAL,
+        "remote_api": ParseMode.REMOTE_API
+    }
+    
+    args = MinerUOCRLanguagesArgs(
+        mode=mode_map.get(kwargs["mode"], ParseMode.LOCAL),
+        api_base=kwargs.get("api_base"),
+        api_token=kwargs.get("api_token")
+    )
+    
+    # 创建工具并执行
+    config = _load_mineru_config(kwargs.get("config"))
+    tool = GetOCRLanguagesTool(config)
+    
+    return await tool.get_languages(args)
+
+
+def _load_mineru_config(config_path: Optional[str]):
+    """加载 MinerU 配置"""
+    from agenticx.tools.remote import MinerUConfig
+    
+    config_data = {}
+    
+    if config_path:
+        config_file = Path(config_path)
+        if config_file.exists():
+            import json
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+    
+    # 从环境变量补充配置
+    if not config_data.get("api_key"):
+        config_data["api_key"] = os.getenv("MINERU_API_KEY")
+    if not config_data.get("base_url"):
+        config_data["base_url"] = os.getenv("MINERU_BASE_URL")
+    
+    # 创建 MinerUConfig 对象
+    return MinerUConfig(**config_data) if config_data else MinerUConfig.from_env()
+
+
+def _display_parse_results(result: dict, verbose: bool = False):
+    """显示解析结果"""
+    if result.get("success"):
+        console.print(f"[bold green]✓ 解析完成![/bold green]")
+        
+        if result.get("mode") == "local":
+            results = result.get("results", [])
+            console.print(f"成功解析: {len(results)} 个文件")
+            
+            if verbose and results:
+                table = Table(show_header=True, header_style="bold magenta")
+                table.add_column("文件", style="cyan")
+                table.add_column("任务ID", style="yellow")
+                table.add_column("输出文件数", style="green")
+                
+                for res in results:
+                    artifacts = res.get("artifacts", {})
+                    file_count = len(artifacts.get("markdown_files", []))
+                    table.add_row(
+                        Path(res["source_file"]).name,
+                        res["task_id"],
+                        str(file_count)
+                    )
+                
+                console.print(table)
+        
+        elif result.get("mode") == "remote_api":
+            console.print(f"任务ID: {result.get('task_id')}")
+            console.print(f"输出目录: {result.get('output_dir')}")
+    
+    else:
+        console.print(f"[bold red]✗ 解析失败![/bold red]")
+        if result.get("error"):
+            console.print(f"错误: {result['error']}")
+
+
+def _display_batch_results(result: dict, verbose: bool = False):
+    """显示批量处理结果"""
+    console.print(f"[bold green]✓ 批量处理完成![/bold green]")
+    console.print(f"任务ID: {result.get('task_id')}")
+    console.print(f"输出目录: {result.get('output_dir')}")
+    
+    upload_summary = result.get("upload_summary", {})
+    console.print(f"文件上传: {upload_summary.get('success_count', 0)}/{upload_summary.get('total_files', 0)}")
+    
+    if verbose and upload_summary.get("failed_files"):
+        console.print("\n[yellow]上传失败的文件:[/yellow]")
+        for failed in upload_summary["failed_files"]:
+            console.print(f"  - {failed['file']}: {failed['error']}")
+
+
+def _display_languages_results(result: dict):
+    """显示语言查询结果"""
+    if result.get("success"):
+        languages = result.get("languages", [])
+        console.print(f"[bold green]✓ 查询成功![/bold green]")
+        console.print(f"支持的语言数量: {len(languages)}")
+        
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("代码", style="cyan")
+        table.add_column("名称", style="white")
+        table.add_column("描述", style="yellow")
+        
+        for lang in languages:
+            if isinstance(lang, dict):
+                table.add_row(
+                    lang.get("code", ""),
+                    lang.get("name", ""),
+                    lang.get("description", "")
+                )
+            else:
+                table.add_row(str(lang), "", "")
+        
+        console.print(table)
+    else:
+        console.print(f"[bold red]✗ 查询失败![/bold red]")
+        if result.get("error"):
+            console.print(f"错误: {result['error']}")
+
+
+def _show_parse_help():
+    """显示解析命令帮助"""
+    options_table = Table(show_header=False, box=None, padding=(0, 1))
+    options_table.add_column("Option", style="cyan")
+    options_table.add_column("Description")
+    options_table.add_row("--output      -o  TEXT", "输出目录")
+    options_table.add_row("--mode        -m  TEXT", "解析模式: local, remote_api, remote_mcp [default: local]")
+    options_table.add_row("--language    -l  TEXT", "OCR 语言 [default: auto]")
+    options_table.add_row("--api-base        TEXT", "远程 API 基础 URL")
+    options_table.add_row("--api-token       TEXT", "远程 API 令牌")
+    options_table.add_row("--backend     -b  TEXT", "后端类型: PIPELINE, VLM_HTTP [default: PIPELINE]")
+    options_table.add_row("--formula/--no-formula", "启用/禁用公式识别 [default: formula]")
+    options_table.add_row("--table/--no-table", "启用/禁用表格识别 [default: table]")
+    options_table.add_row("--pages       -p  TEXT", "页面范围，如 '1-5,10,15-20'")
+    options_table.add_row("--config      -c  TEXT", "配置文件路径")
+    options_table.add_row("--verbose     -v", "详细输出")
+    options_table.add_row("--help        -h", "显示帮助信息")
+    
+    console.print("\n[bold yellow]Usage:[/bold yellow] agx mineru parse [OPTIONS] FILES...\n")
+    console.print("解析文档文件（PDF、PPT、DOC等）并转换为结构化格式\n")
+    console.print(Panel(options_table, title="Options", title_align="left"))
+
+
+def _show_batch_help():
+    """显示批量处理命令帮助"""
+    options_table = Table(show_header=False, box=None, padding=(0, 1))
+    options_table.add_column("Option", style="cyan")
+    options_table.add_column("Description")
+    options_table.add_row("--output      -o  TEXT", "输出目录")
+    options_table.add_row("--patterns        TEXT", "文件匹配模式（逗号分隔） [default: *.pdf,*.png,*.jpg,*.jpeg]")
+    options_table.add_row("--mode        -m  TEXT", "解析模式: local, remote_api [default: local]")
+    options_table.add_row("--language    -l  TEXT", "OCR 语言 [default: auto]")
+    options_table.add_row("--api-base        TEXT", "远程 API 基础 URL")
+    options_table.add_row("--api-token       TEXT", "远程 API 令牌")
+    options_table.add_row("--backend     -b  TEXT", "后端类型: PIPELINE, VLM_HTTP [default: PIPELINE]")
+    options_table.add_row("--formula/--no-formula", "启用/禁用公式识别 [default: formula]")
+    options_table.add_row("--table/--no-table", "启用/禁用表格识别 [default: table]")
+    options_table.add_row("--max-concurrent  INTEGER", "最大并发数 [default: 3]")
+    options_table.add_row("--config      -c  TEXT", "配置文件路径")
+    options_table.add_row("--verbose     -v", "详细输出")
+    options_table.add_row("--help        -h", "显示帮助信息")
+    
+    console.print("\n[bold yellow]Usage:[/bold yellow] agx mineru batch [OPTIONS] INPUT_DIR\n")
+    console.print("批量处理目录中的文档文件\n")
+    console.print(Panel(options_table, title="Options", title_align="left"))
+
+
+def _show_languages_help():
+    """显示语言查询命令帮助"""
+    options_table = Table(show_header=False, box=None, padding=(0, 1))
+    options_table.add_column("Option", style="cyan")
+    options_table.add_column("Description")
+    options_table.add_row("--mode        -m  TEXT", "查询模式: local, remote_api [default: local]")
+    options_table.add_row("--api-base        TEXT", "远程 API 基础 URL")
+    options_table.add_row("--api-token       TEXT", "远程 API 令牌")
+    options_table.add_row("--config      -c  TEXT", "配置文件路径")
+    options_table.add_row("--help        -h", "显示帮助信息")
+    
+    console.print("\n[bold yellow]Usage:[/bold yellow] agx mineru languages [OPTIONS]\n")
+    console.print("获取支持的 OCR 语言列表\n")
+    console.print(Panel(options_table, title="Options", title_align="left"))
+
+
+def main():
+    """主入口函数"""
+    # Restore the original argv captured before CLI framework imports.
+    sys.argv = _SAVED_CLI_ARGV
+    app()
+
+
+if __name__ == "__main__":
+    main()

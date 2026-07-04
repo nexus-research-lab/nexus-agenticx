@@ -1,0 +1,134 @@
+"""
+AgenticX 工具系统
+
+这个模块提供了统一的工具抽象和实现，支持：
+- 基于类的工具 (BaseTool)
+- 函数式工具 (FunctionTool, @tool 装饰器)
+- 远程工具 (RemoteTool)
+- 内置工具集 (BuiltInTools)
+"""
+
+from .base import BaseTool, ToolError, ToolTimeoutError, ToolValidationError
+from .function_tool import FunctionTool, tool
+from .executor import ToolExecutor, ExecutionResult, ToolCallingRecord
+from .credentials import CredentialStore
+from .remote import RemoteTool, MCPClient, MCPServerConfig, load_mcp_config, create_mcp_client
+try:
+    from .remote_v2 import MCPClientV2, RemoteToolV2
+except ImportError:  # mcp package not installed
+    MCPClientV2 = None  # type: ignore
+    RemoteToolV2 = None  # type: ignore
+from .mineru import create_mineru_parse_tool, create_mineru_ocr_languages_tool
+from .windowed import WindowedFileTool
+from .shell_bundle import ShellBundleLoader, ShellScriptTool
+from .skill_bundle import SkillBundleLoader, SkillTool, SkillMetadata, SkillGate, check_skill_gate
+from .policy import ToolPolicyStack, ToolPolicyLayer, PolicyAction, ToolPolicyDeniedError
+try:
+    from .mcp_hub import MCPHub, MCPHubConfig
+except ImportError:  # pragma: no cover - optional dependency chain
+    MCPHub = None  # type: ignore
+    MCPHubConfig = None  # type: ignore
+try:
+    from .skill_sync import sync_skills, check_skills_sync, SyncResult, CheckResult
+except ImportError:  # pragma: no cover - optional in early imports
+    sync_skills = None  # type: ignore
+    check_skills_sync = None  # type: ignore
+    SyncResult = None  # type: ignore
+    CheckResult = None  # type: ignore
+try:
+    from .builtin import (
+        WebSearchTool,
+        FileTool,
+        CodeInterpreterTool,
+        HttpRequestTool,
+        JsonTool,
+    )
+except Exception:  # pragma: no cover - sandbox may block requests SSL
+    WebSearchTool = None  # type: ignore
+    FileTool = None  # type: ignore
+    CodeInterpreterTool = None  # type: ignore
+    HttpRequestTool = None  # type: ignore
+    JsonTool = None  # type: ignore
+from .security import human_in_the_loop, ApprovalRequiredError
+from .tool_context import ToolContext, LlmRequest
+from .openapi_toolset import OpenAPIToolset, RestApiTool
+from .unified_document import UnifiedDocumentTool
+from .document_routers import DocumentRouter, create_default_router
+from .adapters.liteparse import LiteParseAdapter
+
+# Sandbox tools (OpenSandbox-inspired)
+from .sandbox_tools import (
+    SandboxFileTool,
+    SandboxCommandTool,
+    SandboxCodeInterpreterTool,
+    create_sandbox_tools,
+    register_sandbox_tools,
+)
+
+__all__ = [
+    # Base classes
+    "BaseTool",
+    "ToolError",
+    "ToolTimeoutError", 
+    "ToolValidationError",
+    # Tool Context (ADK-inspired)
+    "ToolContext",
+    "LlmRequest",
+    # Security
+    "human_in_the_loop",
+    "ApprovalRequiredError",
+    # Function tools
+    "FunctionTool",
+    "tool",
+    # Executor
+    "ToolExecutor",
+    "ExecutionResult",
+    "ToolCallingRecord",
+    # Credential management
+    "CredentialStore",
+    # Built-in tools
+    "WebSearchTool",
+    "FileTool", 
+    "CodeInterpreterTool",
+    "HttpRequestTool",
+    "JsonTool",
+    # Remote/MCP tools (legacy)
+    "RemoteTool",
+    "MCPClient",
+    "MCPServerConfig",
+    "load_mcp_config",
+    "create_mcp_client",
+    # Remote/MCP tools V2 (基于官方 SDK，持久化会话)
+    "MCPClientV2",
+    "RemoteToolV2",
+    "MCPHub",
+    "MCPHubConfig",
+    # OpenAPI tools (ADK-inspired)
+    "OpenAPIToolset",
+    "RestApiTool",
+    # MinerU 工具
+    "create_mineru_parse_tool",
+    "create_mineru_ocr_languages_tool",
+    "WindowedFileTool",
+    "ShellBundleLoader",
+    "ShellScriptTool",
+    # Skill Bundle (Anthropic SKILL.md 规范)
+    "SkillBundleLoader",
+    "SkillTool",
+    "SkillMetadata",
+    "sync_skills",
+    "check_skills_sync",
+    "SyncResult",
+    "CheckResult",
+    # Unified Document Tool (OWL-inspired)
+    "UnifiedDocumentTool",
+    "DocumentRouter",
+    "create_default_router",
+    "LiteParseAdapter",
+    # Sandbox tools (OpenSandbox-inspired)
+    "SandboxFileTool",
+    "SandboxCommandTool",
+    "SandboxCodeInterpreterTool",
+    "create_sandbox_tools",
+    "register_sandbox_tools",
+] 

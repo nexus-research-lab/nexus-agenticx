@@ -1,0 +1,756 @@
+"""
+MCP Client V2: 基于官方 SDK 的持久化会话实现
+
+本模块将官方 MCP Python SDK 参考进 AgenticX，实现：
+1. 持久化会话（消除每次调用重启进程的开销）
+2. 完整的协议支持（Tools, Resources, Sampling）
+3. 智能体自动挖掘能力（通过 Sampling 实现工具内推理）
+
+上游来源：
+- mcp/client/session.py: ClientSession 实现
+- mcp/client/stdio/__init__.py: stdio_client transport
+- mcp/types.py: 协议类型定义
+
+"""
+from __future__ import annotations
+
+import errno
+import logging
+import os
+from contextlib import AsyncExitStack
+from datetime import timedelta
+from typing import Any, Dict, List, Literal, Optional, Set, Type, Union
+from urllib.parse import urlparse
+
+import anyio  # type: ignore
+from pydantic import BaseModel, Field, model_validator  # type: ignore
+
+try:
+    import mcp.types as mcp_types  # type: ignore
+    from mcp.client.session import ClientSession  # type: ignore
+    from mcp.client.stdio import StdioServerParameters, stdio_client  # type: ignore
+except ImportError:
+    mcp_types = None  # type: ignore  # pip install "agenticx[mcp]"
+    ClientSession = None  # type: ignore
+    StdioServerParameters = None  # type: ignore
+    stdio_client = None  # type: ignore
+
+try:  # Streamable HTTP transport (mcp SDK >= 1.0)
+    from mcp.client.streamable_http import streamablehttp_client  # type: ignore
+except ImportError:
+    streamablehttp_client = None  # type: ignore
+
+try:  # SSE transport (legacy MCP wire protocol)
+    from mcp.client.sse import sse_client  # type: ignore
+except ImportError:
+    sse_client = None  # type: ignore
+
+from .base import BaseTool, ToolError
+
+# 类型导入（用于 Sampling）
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..llms.base import BaseLLMProvider
+
+logger = logging.getLogger(__name__)
+
+# stdio / stream failures where a full transport reset + one retry often recovers.
+_RECOVERABLE_TRANSPORT_TYPE_NAMES = frozenset(
+    {"ClosedResourceError", "BrokenResourceError", "EndOfStream"}
+)
+
+
+def _is_recoverable_mcp_transport_error(exc: BaseException) -> bool:
+    cur: Optional[BaseException] = exc
+    seen: Set[int] = set()
+    while cur is not None and len(seen) < 8:
+        oid = id(cur)
+        if oid in seen:
+            break
+        seen.add(oid)
+        if type(cur).__name__ in _RECOVERABLE_TRANSPORT_TYPE_NAMES:
+            return True
+        if isinstance(cur, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            return True
+        if isinstance(cur, OSError) and getattr(cur, "errno", None) in (
+            errno.EPIPE,
+            errno.ECONNRESET,
+            errno.ENOTCONN,
+        ):
+            return True
+        cur = cur.__cause__
+    return False
+
+
+MCPTransport = Literal["stdio", "streamable_http", "sse"]
+
+
+class MCPServerConfig(BaseModel):
+    """MCP server config supporting both stdio and remote (HTTP/SSE) transports.
+
+    Backward compatibility:
+      - Existing stdio entries (``command`` + optional ``args``/``env``/``cwd``)
+        keep working unchanged. ``transport`` is auto-inferred to ``"stdio"``.
+      - New remote entries provide ``url`` (and optional ``headers``).
+        ``transport`` is inferred from the URL suffix: ``/sse`` → ``"sse"``,
+        otherwise ``"streamable_http"``. Callers may also set ``transport``
+        explicitly to override the inference.
+
+    Exactly one of ``command`` or ``url`` MUST be provided.
+    """
+
+    name: str
+    # Transport (auto-inferred when omitted).
+    transport: Optional[MCPTransport] = None
+    # stdio fields
+    command: Optional[str] = None
+    args: List[str] = Field(default_factory=list)
+    env: Dict[str, str] = Field(default_factory=dict)
+    cwd: Optional[str] = Field(default=None, description="Working directory for stdio child process.")
+    # remote fields
+    url: Optional[str] = Field(default=None, description="Remote MCP server URL (streamable-http / sse).")
+    headers: Dict[str, str] = Field(
+        default_factory=dict,
+        description="HTTP headers sent to the remote MCP server (e.g. Authorization).",
+    )
+    # common
+    timeout: float = 60.0
+    enabled_tools: List[str] = Field(
+        default_factory=list,
+        description="Whitelist of tools to expose; empty means all tools.",
+    )
+    assign_to_agents: List[str] = Field(
+        default_factory=list,
+        description="Assign this MCP to specific agents; empty means all agents.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_transport(self) -> "MCPServerConfig":
+        has_command = bool(self.command and str(self.command).strip())
+        has_url = bool(self.url and str(self.url).strip())
+        if has_url and has_command:
+            raise ValueError(
+                f"MCP server '{self.name}' must specify exactly one of `command` or `url`, not both"
+            )
+        if not has_url and not has_command:
+            raise ValueError(
+                f"MCP server '{self.name}' must specify exactly one of `command` or `url`"
+            )
+        if has_url:
+            if self.transport is None:
+                # /sse suffix → SSE; everything else defaults to streamable-http.
+                # Trim query string before suffix check so URLs like
+                # "https://host/sse?token=x" still resolve correctly.
+                url_path = str(self.url).split("?", 1)[0].rstrip("/")
+                self.transport = "sse" if url_path.endswith("/sse") else "streamable_http"
+        else:
+            if self.transport is None:
+                self.transport = "stdio"
+            elif self.transport != "stdio":
+                raise ValueError(
+                    f"MCP server '{self.name}' has command but transport={self.transport!r}; "
+                    "stdio transport is required when command is set"
+                )
+        return self
+
+
+class MCPToolInfo(BaseModel):
+    """MCP 工具信息"""
+    name: str
+    description: str
+    inputSchema: Dict[str, Any]
+    outputSchema: Optional[Dict[str, Any]] = None
+
+
+class MCPClientV2:
+    """
+    MCP 客户端 V2：基于官方 SDK 的持久化会话实现
+    
+    核心改进：
+    - 持久化会话：进程长驻，多次调用复用同一连接
+    - 完整协议支持：Tools, Resources, Sampling
+    - 自动重连：异常断开后自动恢复
+    """
+    
+    def __init__(
+        self,
+        server_config: Union[MCPServerConfig, Dict[str, Any]],
+        llm_provider: Optional["BaseLLMProvider"] = None,
+    ):
+        """
+        初始化 MCP 客户端
+        
+        Args:
+            server_config: 服务器配置
+            llm_provider: LLM 提供者（用于 Sampling 机制，允许 Server 反向调用 LLM）
+        """
+        if isinstance(server_config, dict):
+            server_config = MCPServerConfig(**server_config)
+        self.server_config = server_config
+        self.llm_provider = llm_provider
+        
+        # 会话状态
+        self._session: Optional[ClientSession] = None
+        self._exit_stack: Optional[AsyncExitStack] = None
+        self._session_lock = anyio.Lock()
+        # Serialize stdio MCP RPCs; concurrent call_tool/list_tools on one client breaks the stream.
+        self._stdio_lock = anyio.Lock()
+        self._tools_cache: Optional[List[MCPToolInfo]] = None
+        self._initialized = False
+        self._closed = False
+
+    async def _reset_mcp_connection_unlocked(self) -> None:
+        """Tear down stdio stack and session. Caller must hold ``_session_lock``."""
+        if self._exit_stack is not None:
+            try:
+                await self._exit_stack.aclose()
+            except Exception as ex:
+                logger.warning(
+                    "MCP transport reset (%s): %s",
+                    self.server_config.name,
+                    ex,
+                )
+            self._exit_stack = None
+        self._session = None
+        self._initialized = False
+        self._tools_cache = None
+
+    async def _ensure_session(self) -> ClientSession:
+        """确保会话已初始化（线程安全）"""
+        async with self._session_lock:
+            if self._session is None or not self._initialized:
+                await self._create_session()
+            
+            if self._session is None:
+                raise RuntimeError("Failed to create session")
+            
+            return self._session
+    
+    async def __aenter__(self):
+        """异步上下文管理器入口（用于保持会话打开）"""
+        async with self._stdio_lock:
+            await self._ensure_session()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """异步上下文管理器退出（清理资源）"""
+        await self.close()
+    
+    async def _create_session(self) -> None:
+        """
+        创建新的 MCP 会话（持久化）
+        
+        使用 AsyncExitStack 来管理 transport 和 session 的生命周期。
+        参考官方示例：simple-chatbot/main.py
+        """
+        if self._closed:
+            raise RuntimeError("Client has been closed")
+
+        if ClientSession is None:
+            raise RuntimeError(
+                "MCP SDK 未安装：当前 Python 环境下 `from mcp.client.session import ClientSession` 失败。"
+                "请在与 Studio 相同的解释器下执行 "
+                "`pip install 'mcp>=1.0.0,<2'`（或 `pip install -e \".[desktop-runtime]\"`），"
+                "然后重启 Studio。"
+            )
+
+        transport = self.server_config.transport or "stdio"
+        logger.info(
+            "Creating persistent MCP session for server=%s transport=%s",
+            self.server_config.name,
+            transport,
+        )
+
+        # 创建 exit stack（如果还没有）
+        if self._exit_stack is None:
+            self._exit_stack = AsyncExitStack()
+            await self._exit_stack.__aenter__()
+
+        try:
+            if transport == "stdio":
+                if stdio_client is None or StdioServerParameters is None:
+                    raise RuntimeError(
+                        "stdio transport unavailable: `mcp.client.stdio` import failed."
+                    )
+                # 构建环境变量
+                env = dict(os.environ)
+                env.update(self.server_config.env)
+                server_params = StdioServerParameters(
+                    command=self.server_config.command,
+                    args=self.server_config.args,
+                    env=env,
+                    cwd=self.server_config.cwd,
+                )
+                stdio_transport = await self._exit_stack.enter_async_context(
+                    stdio_client(server_params)
+                )
+                read_stream, write_stream = stdio_transport
+            elif transport == "streamable_http":
+                if streamablehttp_client is None:
+                    raise RuntimeError(
+                        "streamable-http transport unavailable: "
+                        "`mcp.client.streamable_http` import failed. "
+                        "Upgrade `mcp` SDK to >=1.0."
+                    )
+                http_cm = streamablehttp_client(
+                    url=self.server_config.url,
+                    headers=dict(self.server_config.headers) or None,
+                    timeout=timedelta(seconds=float(self.server_config.timeout)),
+                )
+                streams = await self._exit_stack.enter_async_context(http_cm)
+                # streamablehttp_client returns (read, write, get_session_id_callback)
+                read_stream, write_stream = streams[0], streams[1]
+            elif transport == "sse":
+                if sse_client is None:
+                    raise RuntimeError(
+                        "sse transport unavailable: `mcp.client.sse` import failed."
+                    )
+                sse_cm = sse_client(
+                    url=self.server_config.url,
+                    headers=dict(self.server_config.headers) or None,
+                )
+                read_stream, write_stream = await self._exit_stack.enter_async_context(sse_cm)
+            else:
+                raise ToolError(
+                    f"unsupported MCP transport: {transport!r}",
+                    self.server_config.name,
+                )
+
+            # 进入 ClientSession context（保持 session 打开）
+            session = await self._exit_stack.enter_async_context(
+                ClientSession(
+                    read_stream=read_stream,
+                    write_stream=write_stream,
+                    client_info=mcp_types.Implementation(
+                        name="AgenticX",
+                        version="1.0.0"
+                    ),
+                    # P1: Sampling 机制桥接
+                    sampling_callback=self._handle_sampling if self.llm_provider else None,
+                )
+            )
+            
+            # 初始化会话
+            init_result = await session.initialize()
+            logger.info(
+                f"MCP session initialized: protocol={init_result.protocolVersion}, "
+                f"server={init_result.serverInfo.name}"
+            )
+            
+            # 保存会话引用（exit_stack 会保持所有 context 打开）
+            self._session = session
+            self._initialized = True
+            
+        except Exception as e:
+            # Log without leaking headers (may contain Bearer token / PAT).
+            host_hint = ""
+            if transport != "stdio" and self.server_config.url:
+                try:
+                    host_hint = f" host={urlparse(self.server_config.url).netloc}"
+                except Exception:
+                    host_hint = ""
+            logger.warning(
+                "MCP session bring-up failed: server=%s transport=%s%s err=%s: %s",
+                self.server_config.name,
+                transport,
+                host_hint,
+                type(e).__name__,
+                e,
+            )
+            # 清理资源
+            if self._exit_stack is not None:
+                try:
+                    await self._exit_stack.aclose()
+                except Exception:
+                    pass
+                self._exit_stack = None
+            raise
+    
+    async def discover_tools(self) -> List[MCPToolInfo]:
+        """自动发现 MCP 服务器提供的所有工具"""
+        if self._tools_cache is not None:
+            return self._tools_cache
+
+        async with self._stdio_lock:
+            if self._tools_cache is not None:
+                return self._tools_cache
+            session = await self._ensure_session()
+            result = await session.list_tools()
+
+            tools = []
+            for tool in result.tools:
+                tool_info = MCPToolInfo(
+                    name=tool.name,
+                    description=tool.description or "",
+                    inputSchema=tool.inputSchema,
+                    outputSchema=tool.outputSchema,
+                )
+                tools.append(tool_info)
+                logger.debug(f"Discovered tool: {tool_info.name}")
+
+            logger.info(f"Discovered {len(tools)} tools from server '{self.server_config.name}'")
+            self._tools_cache = tools
+            return tools
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: Optional[Dict[str, Any]] = None,
+    ) -> mcp_types.CallToolResult:
+        """
+        调用工具（使用持久化会话）
+        
+        Args:
+            name: 工具名称
+            arguments: 工具参数
+            
+        Returns:
+            CallToolResult: 工具执行结果
+        """
+        async with self._stdio_lock:
+            last_exc: Optional[BaseException] = None
+            for attempt in range(2):
+                session = await self._ensure_session()
+                try:
+                    return await session.call_tool(
+                        name=name,
+                        arguments=arguments or {},
+                    )
+                except Exception as e:
+                    last_exc = e
+                    logger.error(
+                        "Tool call failed: %s (attempt %s/%s): %s",
+                        name,
+                        attempt + 1,
+                        2,
+                        e,
+                    )
+                    async with self._session_lock:
+                        await self._reset_mcp_connection_unlocked()
+                    if attempt == 0 and _is_recoverable_mcp_transport_error(e):
+                        logger.info(
+                            "MCP %s: retrying tool %s after transport reset",
+                            self.server_config.name,
+                            name,
+                        )
+                        continue
+                    break
+            assert last_exc is not None
+            raise ToolError(f"Tool call failed: {last_exc}", name) from last_exc
+
+    def _create_pydantic_model_from_schema(
+        self,
+        schema: Dict[str, Any],
+        model_name: str
+    ) -> Type[BaseModel]:
+        """从 JSON Schema 创建 Pydantic 模型（复用旧版逻辑）"""
+        from pydantic import create_model  # type: ignore
+        
+        if not schema or schema.get('type') != 'object':
+            return create_model(model_name)
+        
+        properties = schema.get('properties', {})
+        required = schema.get('required', [])
+        
+        fields = {}
+        for field_name, field_schema in properties.items():
+            field_type = self._json_schema_to_python_type(field_schema)
+            field_description = field_schema.get('description', '')
+            
+            if field_name in required:
+                fields[field_name] = (field_type, Field(description=field_description))
+            else:
+                fields[field_name] = (Optional[field_type], Field(default=None, description=field_description))
+        
+        return create_model(model_name, **fields)
+    
+    def _json_schema_to_python_type(self, schema: Dict[str, Any]) -> type:
+        """将 JSON Schema 类型转换为 Python 类型"""
+        schema_type = schema.get('type', 'string')
+        
+        if schema_type == 'string':
+            return str
+        elif schema_type == 'integer':
+            return int
+        elif schema_type == 'number':
+            return float
+        elif schema_type == 'boolean':
+            return bool
+        elif schema_type == 'array':
+            item_type = self._json_schema_to_python_type(schema.get('items', {'type': 'string'}))
+            return List[item_type]
+        elif schema_type == 'object':
+            return Dict[str, Any]
+        else:
+            return str  # 默认为字符串
+    
+    async def create_tool(
+        self,
+        tool_name: str,
+        organization_id: Optional[str] = None
+    ) -> "RemoteToolV2":
+        """为指定的工具名称创建 RemoteToolV2 实例"""
+        tools = await self.discover_tools()
+        
+        # 查找指定的工具
+        tool_info = None
+        for tool in tools:
+            if tool.name == tool_name:
+                tool_info = tool
+                break
+        
+        if tool_info is None:
+            available_tools = [tool.name for tool in tools]
+            raise ToolError(
+                f"Tool '{tool_name}' not found. Available tools: {available_tools}",
+                tool_name
+            )
+        
+        # 从 inputSchema 创建 Pydantic 模型
+        args_schema = self._create_pydantic_model_from_schema(
+            tool_info.inputSchema,
+            f"{tool_name.title().replace('_', '')}Args"
+        )
+        
+        return RemoteToolV2(
+            client=self,
+            tool_name=tool_name,
+            tool_info=tool_info,
+            args_schema=args_schema,
+            organization_id=organization_id,
+        )
+    
+    async def create_all_tools(
+        self,
+        organization_id: Optional[str] = None
+    ) -> List["RemoteToolV2"]:
+        """创建服务器提供的所有工具"""
+        tools = await self.discover_tools()
+        remote_tools = []
+        
+        for tool_info in tools:
+            args_schema = self._create_pydantic_model_from_schema(
+                tool_info.inputSchema,
+                f"{tool_info.name.title().replace('_', '')}Args"
+            )
+            
+            remote_tool = RemoteToolV2(
+                client=self,
+                tool_name=tool_info.name,
+                tool_info=tool_info,
+                args_schema=args_schema,
+                organization_id=organization_id,
+            )
+            remote_tools.append(remote_tool)
+        
+        return remote_tools
+    
+    async def _handle_sampling(
+        self,
+        context: Any,  # RequestContext[ClientSession, Any]
+        params: mcp_types.CreateMessageRequestParams,
+    ) -> mcp_types.CreateMessageResult | mcp_types.CreateMessageResultWithTools | mcp_types.ErrorData:
+        """
+        Sampling 回调：将 MCP Server 的采样请求桥接到 AgenticX 的 LLMProvider
+        
+        这是实现"智能体自动挖掘"的关键机制：允许外部工具在执行中反向请求 LLM 能力。
+        
+        Args:
+            context: MCP 请求上下文
+            params: 采样请求参数（包含消息、工具定义等）
+            
+        Returns:
+            CreateMessageResult: LLM 生成的结果
+        """
+        if self.llm_provider is None:
+            return mcp_types.ErrorData(
+                code=mcp_types.INVALID_REQUEST,
+                message="Sampling not supported: no LLM provider configured",
+            )
+        
+        try:
+            logger.info(f"Handling sampling request from MCP server: {len(params.messages)} messages")
+            
+            # 转换 MCP 消息格式为 AgenticX LLMProvider 格式
+            # MCP 使用 SamplingMessage，需要转换为标准的 chat messages
+            messages = []
+            for msg in params.messages:
+                role = msg.role  # "user" or "assistant"
+                # 处理 content（可能是单个 block 或列表）
+                if isinstance(msg.content, list):
+                    content_blocks = msg.content
+                else:
+                    content_blocks = [msg.content]
+                
+                # 提取文本内容（简化处理，实际可能需要处理工具调用等）
+                text_parts = []
+                for block in content_blocks:
+                    if isinstance(block, mcp_types.TextContent):
+                        text_parts.append(block.text)
+                    elif isinstance(block, mcp_types.ImageContent):
+                        # 图像内容：转换为描述或 base64
+                        text_parts.append(f"[Image: {block.mimeType}]")
+                    elif isinstance(block, mcp_types.AudioContent):
+                        text_parts.append(f"[Audio: {block.mimeType}]")
+                    # ToolUseContent 和 ToolResultContent 需要特殊处理
+                
+                content = "\n".join(text_parts) if text_parts else ""
+                if content:
+                    messages.append({"role": role, "content": content})
+            
+            # 调用 LLMProvider
+            # 注意：这里需要根据 params 中的参数（temperature, maxTokens 等）调整调用
+            llm_kwargs = {}
+            if params.temperature is not None:
+                llm_kwargs["temperature"] = params.temperature
+            if params.maxTokens:
+                llm_kwargs["max_tokens"] = params.maxTokens
+            if params.stopSequences:
+                llm_kwargs["stop"] = params.stopSequences
+            
+            # 调用 LLM
+            response = await self.llm_provider.ainvoke(messages, **llm_kwargs)
+            
+            # 转换 AgenticX LLMResponse 为 MCP CreateMessageResult
+            # 提取模型名称（如果可用）
+            model_name = getattr(response, "model_name", None) or self.llm_provider.model
+            
+            # 提取文本内容（LLMChoice 有 content 字段）
+            if response.choices and len(response.choices) > 0:
+                content_text = response.choices[0].content
+            else:
+                content_text = ""
+            
+            # 检查是否有工具调用（如果 params.tools 存在且 LLM 返回了工具调用）
+            # 这里简化处理，实际需要解析 LLM 响应中的工具调用
+            
+            # 返回结果
+            return mcp_types.CreateMessageResult(
+                role="assistant",
+                content=mcp_types.TextContent(
+                    type="text",
+                    text=content_text
+                ),
+                model=model_name,
+                stopReason="endTurn",  # 简化处理
+            )
+            
+        except Exception as e:
+            logger.exception(f"Error in sampling callback: {e}")
+            return mcp_types.ErrorData(
+                code=mcp_types.INTERNAL_ERROR,
+                message=f"Sampling failed: {str(e)}",
+            )
+    
+    async def close(self) -> None:
+        """关闭会话（清理资源）"""
+        async with self._stdio_lock:
+            async with self._session_lock:
+                if self._closed:
+                    return
+
+                self._closed = True
+                await self._reset_mcp_connection_unlocked()
+            logger.info(f"Closed MCP session for server: {self.server_config.name}")
+
+
+class RemoteToolV2(BaseTool):
+    """
+    远程工具 V2：基于持久化会话的 MCP 工具实现
+    
+    相比旧版 RemoteTool 的改进：
+    - 使用持久化会话，消除每次调用重启进程的开销
+    - 支持完整的 MCP 协议特性
+    """
+    
+    def __init__(
+        self,
+        client: MCPClientV2,
+        tool_name: str,
+        tool_info: MCPToolInfo,
+        args_schema: Optional[Type[BaseModel]] = None,
+        organization_id: Optional[str] = None,
+    ):
+        """
+        初始化远程工具
+        
+        Args:
+            client: MCP 客户端实例
+            tool_name: 工具名称
+            tool_info: 工具信息
+            args_schema: 参数模式
+            organization_id: 组织 ID
+        """
+        super().__init__(
+            name=f"{client.server_config.name}_{tool_name}",
+            description=tool_info.description or f"Remote tool {tool_name}",
+            args_schema=args_schema,
+            timeout=client.server_config.timeout,
+            organization_id=organization_id,
+        )
+        self.client = client
+        self.tool_name = tool_name
+        self.tool_info = tool_info
+    
+    def _run(self, **kwargs) -> Any:
+        """同步执行工具（使用 asyncio.run）"""
+        import asyncio
+        return asyncio.run(self._arun(**kwargs))
+    
+    async def _arun(self, **kwargs) -> Any:
+        """异步执行工具（使用持久化会话）"""
+        # 调用客户端的方法
+        result = await self.client.call_tool(
+            name=self.tool_name,
+            arguments=kwargs,
+        )
+        
+        if result.isError:
+            error_msg = "Unknown error"
+            if result.content:
+                # 尝试从 content 中提取错误信息
+                for block in result.content:
+                    if hasattr(block, 'text'):
+                        error_msg = block.text
+                        break
+            raise ToolError(
+                f"Remote tool execution failed: {error_msg}",
+                self.name,
+                {"tool": self.tool_name, "result": result.model_dump()}
+            )
+        
+        # 提取结果内容
+        if result.content:
+            # 返回第一个文本块的内容
+            for block in result.content:
+                if hasattr(block, 'text'):
+                    return block.text
+                elif hasattr(block, 'blob'):
+                    return block.blob
+        
+        # 如果有结构化内容，返回它
+        if result.structuredContent:
+            return result.structuredContent
+        
+        return None
+    
+    def to_openai_schema(self) -> Dict[str, Any]:
+        """转换为 OpenAI 工具格式"""
+        schema = {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description
+            }
+        }
+        if self.args_schema:
+            json_schema = self.args_schema.model_json_schema()
+            schema["function"]["parameters"] = {
+                "type": "object",
+                "properties": json_schema.get("properties", {}),
+                "required": json_schema.get("required", [])
+            }
+        else:
+            schema["function"]["parameters"] = {"type": "object", "properties": {}, "required": []}
+        return schema
+

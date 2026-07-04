@@ -1,0 +1,41 @@
+{
+  "last_sync_upstream_commit": "5a282b8ff4c2fb3cce5ca8c5ffcf953acb438ad6",
+  "last_sync_date": "2026-07-04",
+  "upstream_branch": "main",
+  "known_root_entries": [
+    "agenticx",
+    "tests",
+    "scripts",
+    "docs",
+    "assets",
+    "install.sh",
+    "pyproject.toml",
+    "setup.py",
+    "requirements.txt",
+    "requirements.lock",
+    "README.md",
+    "README_ZN.md",
+    "mkdocs.yml",
+    "LICENSE",
+    "MANIFEST.in",
+    "INSTALL.md",
+    ".gitignore",
+    "AGENTS.md",
+    ".githooks",
+    ".gitmodules"
+  ],
+  "excluded_entries": [
+    "desktop",
+    "enterprise",
+    "nexus-agenticx",
+    "packaging",
+    "examples",
+    "research",
+    "deploy",
+    ".cursor",
+    ".myblog",
+    ".mynotes",
+    ".agenticx",
+    ".github"
+  ]
+}

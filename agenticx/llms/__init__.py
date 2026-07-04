@@ -1,0 +1,116 @@
+"""
+AgenticX LLM Service Provider Module
+
+This module provides a unified interface for interacting with various Large Language Models.
+"""
+
+from .base import BaseLLMProvider
+from .response import LLMResponse, LLMChoice, TokenUsage
+try:  # sandbox may block SSL when importing litellm/requests
+    from .litellm_provider import LiteLLMProvider
+    from .kimi_provider import KimiProvider
+    from .bailian_provider import BailianProvider
+    from .ark_provider import ArkLLMProvider
+    from .zhipu_provider import ZhipuProvider
+    from .qianfan_provider import QianfanProvider
+    from .minimax_provider import MiniMaxProvider
+    from .provider_resolver import ProviderResolver
+    from .llm_factory import LlmFactory
+except Exception:  # pragma: no cover
+    LiteLLMProvider = None  # type: ignore
+    KimiProvider = None  # type: ignore
+    BailianProvider = None  # type: ignore
+    ArkLLMProvider = None  # type: ignore
+    ZhipuProvider = None  # type: ignore
+    QianfanProvider = None  # type: ignore
+    MiniMaxProvider = None  # type: ignore
+    ProviderResolver = None  # type: ignore
+    LlmFactory = None  # type: ignore
+
+from agenticx.llms.failover import FailoverProvider
+from agenticx.llms.response_cache import ResponseCache
+
+# Convenience re-exports for specific models, all using LiteLLMProvider
+# This makes it easy to instantiate a specific provider type.
+
+class OpenAIProvider(LiteLLMProvider if LiteLLMProvider else object):  # type: ignore
+    """Provider for OpenAI models, e.g., 'gpt-4', 'gpt-3.5-turbo'."""
+    pass
+
+class AnthropicProvider(LiteLLMProvider if LiteLLMProvider else object):  # type: ignore
+    """Provider for Anthropic models, e.g., 'claude-3-opus-20240229'."""
+    pass
+
+class OllamaProvider(LiteLLMProvider if LiteLLMProvider else object):  # type: ignore
+    """Provider for local Ollama models, e.g., 'ollama/llama3'."""
+    pass
+
+class GeminiProvider(LiteLLMProvider if LiteLLMProvider else object):  # type: ignore
+    """Provider for Google Gemini models, e.g., 'gemini/gemini-pro'."""
+    pass
+
+# Dedicated provider for Kimi (Moonshot AI)
+class MoonshotProvider(KimiProvider if KimiProvider else object):  # type: ignore
+    """Provider for Moonshot AI Kimi models, e.g., 'kimi-k2-0711-preview'."""
+    pass
+
+# Dedicated provider for Bailian (Alibaba Cloud Dashscope)
+class DashscopeProvider(BailianProvider if BailianProvider else object):  # type: ignore
+    """Provider for Alibaba Cloud Bailian/Dashscope models, e.g., 'qwen-vl-plus'."""
+    pass
+
+# Dedicated provider for Volcengine Ark
+class ArkProvider(ArkLLMProvider if ArkLLMProvider else object):  # type: ignore
+    """Provider for Volcengine Ark models, e.g., 'doubao-seed-1-6'."""
+    pass
+
+class VolcEngineProvider(ArkLLMProvider if ArkLLMProvider else object):  # type: ignore
+    """Alias for ArkProvider (Volcengine Ark platform)."""
+    pass
+
+class ZhiPuProvider(ZhipuProvider if ZhipuProvider else object):  # type: ignore
+    """Provider for Zhipu GLM models."""
+    pass
+
+class QianFanProvider(QianfanProvider if QianfanProvider else object):  # type: ignore
+    """Provider for Baidu Qianfan models."""
+    pass
+
+class MinimaxProvider(MiniMaxProvider if MiniMaxProvider else object):  # type: ignore
+    """Provider for MiniMax models."""
+    pass
+
+
+__all__ = [
+    # Base classes and data structures
+    "BaseLLMProvider",
+    "LLMResponse",
+    "LLMChoice",
+    "TokenUsage",
+
+    # Concrete provider implementations
+    "LiteLLMProvider",
+    "KimiProvider",
+    "BailianProvider",
+    "ArkLLMProvider",
+    "ZhipuProvider",
+    "QianfanProvider",
+    "MiniMaxProvider",
+    "ProviderResolver",
+    "LlmFactory",
+
+    "FailoverProvider",
+    "ResponseCache",
+    # Convenience classes
+    "OpenAIProvider",
+    "AnthropicProvider",
+    "OllamaProvider",
+    "GeminiProvider",
+    "MoonshotProvider",
+    "DashscopeProvider",
+    "ArkProvider",
+    "VolcEngineProvider",
+    "ZhiPuProvider",
+    "QianFanProvider",
+    "MinimaxProvider",
+]

@@ -1,0 +1,672 @@
+import asyncio
+from typing import Any, Optional, Dict, List, AsyncGenerator, Generator, Union, cast
+import litellm  # type: ignore
+
+# GAIA / batch runs call LiteLLM many times; default stderr prints red
+# "Provider List" / "Give Feedback" hints even when the call eventually succeeds.
+litellm.suppress_debug_info = True
+
+from pydantic import Field  # type: ignore
+from .base import BaseLLMProvider, StreamChunk
+from .response import LLMResponse, TokenUsage, LLMChoice
+
+
+def _reasoning_detail_text(detail: Any) -> str:
+    if detail is None:
+        return ""
+    if isinstance(detail, dict):
+        return str(detail.get("text") or "")
+    return str(getattr(detail, "text", "") or "")
+
+
+def _iter_reasoning_delta_texts(delta: Any) -> List[str]:
+    """Extract reasoning/thinking delta text from a streaming chunk delta.
+
+    Different providers use different field names for the thinking phase:
+    - reasoning_content  (DeepSeek-R1, many OpenAI-compat gateways)
+    - reasoning          (Qwen3 / some aibox gateways emit this alongside reasoning_content)
+    - reasoning_details  (MiniMax M2.x)
+
+    When a gateway echoes both ``reasoning`` and ``reasoning_content`` with
+    identical content (e.g. aibox + Qwen3-32B), we deduplicate by preferring
+    ``reasoning_content`` and skipping ``reasoning`` when the value is the same.
+    """
+    out: List[str] = []
+    rc = getattr(delta, "reasoning_content", None)
+    if isinstance(rc, str) and rc:
+        out.append(rc)
+    # Only include `reasoning` when it carries distinct content.
+    reasoning = getattr(delta, "reasoning", None)
+    if isinstance(reasoning, str) and reasoning and reasoning != rc:
+        out.append(reasoning)
+    details = getattr(delta, "reasoning_details", None)
+    if details:
+        for detail in details:
+            text = _reasoning_detail_text(detail)
+            if text:
+                out.append(text)
+    return out
+
+
+def _resolve_litellm_api_key(api_key: Optional[str], base_url: Optional[str]) -> Optional[str]:
+    """LiteLLM's OpenAI client rejects empty api_key even when the gateway does not."""
+    cleaned = str(api_key or "").strip()
+    if cleaned:
+        return cleaned
+    if str(base_url or "").strip():
+        return "placeholder"
+    return api_key
+
+
+def normalize_litellm_model_for_openai_compat_gateway(
+    model: str,
+    base_url: Optional[str],
+) -> str:
+    """Map config/UI model ids to LiteLLM routes for custom OpenAI-compatible gateways.
+
+    Proxies such as China Mobile MOMA expose upstream ids like ``minimax/minimax-m3``.
+    LiteLLM treats the ``minimax/`` prefix as native MiniMax routing and ignores the
+    custom ``base_url``, which surfaces as ``NotFoundError``. Prefix with ``openai/`` so
+    LiteLLM uses the OpenAI client against the configured gateway base.
+    """
+    name = str(model or "").strip()
+    if not name:
+        return name
+    if not str(base_url or "").strip():
+        return name
+    if name.lower().startswith("openai/"):
+        return name
+    return f"openai/{name}"
+
+
+def _is_private_base_url(base_url: Optional[str]) -> bool:
+    """Return True when *base_url* resolves to a private/loopback/intranet address.
+
+    We bypass the system proxy for these URLs because SOCKS5 proxies in common
+    developer setups (e.g. ALL_PROXY=socks5://127.0.0.1:7897) require the
+    socksio package, which is not always installed.  Private addresses never
+    need a proxy.
+    """
+    import ipaddress
+    import re
+    from urllib.parse import urlparse
+
+    url = str(base_url or "").strip()
+    if not url:
+        return False
+    try:
+        host = urlparse(url).hostname or ""
+        try:
+            addr = ipaddress.ip_address(host)
+            return addr.is_private or addr.is_loopback or addr.is_link_local
+        except ValueError:
+            return host == "localhost" or bool(re.match(r"^(local|intranet|corp)\.", host))
+    except Exception:
+        return False
+
+
+def _build_no_proxy_openai_client(api_key: Optional[str], base_url: Optional[str]) -> Optional[Any]:
+    """Return an openai.OpenAI client with proxy bypassed for private URLs.
+
+    LiteLLM's ``client`` kwarg must be an ``openai.OpenAI`` instance.  We
+    construct one with an httpx transport that has no proxy so SOCKS env vars
+    do not cause ImportError when socksio is absent.
+    """
+    if not _is_private_base_url(base_url):
+        return None
+    try:
+        import httpx  # type: ignore
+        import openai  # type: ignore
+        http_client = httpx.Client(transport=httpx.HTTPTransport())
+        return openai.OpenAI(
+            api_key=api_key or "placeholder",
+            base_url=str(base_url or "").rstrip("/") + "/",
+            http_client=http_client,
+        )
+    except Exception:
+        return None
+
+
+def _build_no_proxy_async_openai_client(api_key: Optional[str], base_url: Optional[str]) -> Optional[Any]:
+    """Async variant of _build_no_proxy_openai_client."""
+    if not _is_private_base_url(base_url):
+        return None
+    try:
+        import httpx  # type: ignore
+        import openai  # type: ignore
+        async_http_client = httpx.AsyncClient(transport=httpx.AsyncHTTPTransport())
+        return openai.AsyncOpenAI(
+            api_key=api_key or "placeholder",
+            base_url=str(base_url or "").rstrip("/") + "/",
+            http_client=async_http_client,
+        )
+    except Exception:
+        return None
+
+class LiteLLMProvider(BaseLLMProvider):
+    """
+    An LLM provider that uses the LiteLLM library to interface with various models.
+    This provider can be used for OpenAI, Anthropic, Ollama, and any other
+    provider supported by LiteLLM.
+    """
+    
+    api_key: Optional[str] = Field(default=None, description="API key for the provider")
+    base_url: Optional[str] = Field(default=None, description="Base URL for the API")
+    api_version: Optional[str] = Field(default=None, description="API version to use")
+    timeout: Optional[float] = Field(default=None, description="Request timeout in seconds")
+    max_retries: Optional[int] = Field(default=None, description="Maximum number of retries")
+    fallbacks: Optional[List[str]] = Field(default=None, description="List of fallback model names when primary model fails")
+    drop_params: Optional[bool] = Field(
+        default=None,
+        description="When True, LiteLLM strips unsupported params (e.g. tool_choice) for strict OpenAI-compatible proxies.",
+    )
+    extra_body: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Extra request body fields forwarded verbatim to the provider (e.g. chat_template_kwargs for Qwen3).",
+    )
+
+    def _apply_drop_params_default(self, kwargs: Dict[str, Any]) -> None:
+        if self.drop_params is None:
+            return
+        kwargs.setdefault("drop_params", self.drop_params)
+
+    def _apply_extra_body(self, kwargs: Dict[str, Any]) -> None:
+        """Merge self.extra_body into the call kwargs under the 'extra_body' key.
+
+        Callers may already pass extra_body themselves; provider-level config is
+        applied with lower priority (setdefault logic for top-level keys inside
+        the dict) so call-site overrides always win.
+        """
+        if not self.extra_body:
+            return
+        existing = kwargs.get("extra_body")
+        if not isinstance(existing, dict):
+            existing = {}
+        for k, v in self.extra_body.items():
+            existing.setdefault(k, v)
+        kwargs["extra_body"] = existing
+
+    def invoke(
+        self, prompt: Union[str, List[Dict]], tools: Optional[List[Dict]] = None, **kwargs
+    ) -> LLMResponse:
+        # 处理不同的输入类型
+        if isinstance(prompt, str):
+            messages = [{"role": "user", "content": prompt}]
+        elif isinstance(prompt, list):
+            messages = prompt
+        else:
+            raise ValueError(f"Unsupported prompt type: {type(prompt)}")
+            
+        timeout = kwargs.pop("timeout", self.timeout)
+        if timeout is None:
+            from agenticx.runtime.provider_fallback import _resolve_llm_round_timeout_seconds_from_config
+
+            timeout = _resolve_llm_round_timeout_seconds_from_config()
+        max_retries = kwargs.pop("max_retries", self.max_retries)
+        fallbacks = kwargs.pop("fallbacks", self.fallbacks)
+        self._apply_drop_params_default(kwargs)
+        self._apply_extra_body(kwargs)
+        _no_proxy_client = _build_no_proxy_openai_client(self.api_key, self.base_url)
+        if _no_proxy_client is not None:
+            kwargs.setdefault("client", _no_proxy_client)
+        try:
+            response = litellm.completion(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                api_version=self.api_version,
+                timeout=timeout,
+                max_retries=max_retries,
+                fallbacks=fallbacks,
+                **kwargs,
+            )
+            return self._parse_response(response)
+        except Exception as e:
+            raise
+
+    async def ainvoke(
+        self, prompt: Union[str, List[Dict]], tools: Optional[List[Dict]] = None, **kwargs
+    ) -> LLMResponse:
+        # 处理不同的输入类型
+        if isinstance(prompt, str):
+            messages = [{"role": "user", "content": prompt}]
+        elif isinstance(prompt, list):
+            messages = prompt
+        else:
+            raise ValueError(f"Unsupported prompt type: {type(prompt)}")
+            
+        timeout = kwargs.pop("timeout", self.timeout)
+        if timeout is None:
+            from agenticx.runtime.provider_fallback import _resolve_llm_round_timeout_seconds_from_config
+
+            timeout = _resolve_llm_round_timeout_seconds_from_config()
+        max_retries = kwargs.pop("max_retries", self.max_retries)
+        fallbacks = kwargs.pop("fallbacks", self.fallbacks)
+        self._apply_drop_params_default(kwargs)
+        self._apply_extra_body(kwargs)
+        _no_proxy_async_client = _build_no_proxy_async_openai_client(self.api_key, self.base_url)
+        if _no_proxy_async_client is not None:
+            kwargs.setdefault("client", _no_proxy_async_client)
+        try:
+            response = await litellm.acompletion(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                api_version=self.api_version,
+                timeout=timeout,
+                max_retries=max_retries,
+                fallbacks=fallbacks,
+                **kwargs,
+            )
+            return self._parse_response(response)
+        except Exception as e:
+            raise
+
+    def stream(self, prompt: Union[str, List[Dict]], **kwargs) -> Generator[Union[str, Dict], None, None]:
+        """Stream the language model's response synchronously."""
+        # 处理不同的输入类型
+        if isinstance(prompt, str):
+            messages = [{"role": "user", "content": prompt}]
+        elif isinstance(prompt, list):
+            messages = prompt
+        else:
+            raise ValueError(f"Unsupported prompt type: {type(prompt)}")
+            
+        timeout = kwargs.pop("timeout", self.timeout)
+        if timeout is None:
+            from agenticx.runtime.provider_fallback import _resolve_llm_round_timeout_seconds_from_config
+
+            timeout = _resolve_llm_round_timeout_seconds_from_config()
+        max_retries = kwargs.pop("max_retries", self.max_retries)
+        fallbacks = kwargs.pop("fallbacks", self.fallbacks)
+        self._apply_drop_params_default(kwargs)
+        self._apply_extra_body(kwargs)
+        response_stream = litellm.completion(
+            model=self.model,
+            messages=messages,
+            stream=True,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            api_version=self.api_version,
+            timeout=timeout,
+            max_retries=max_retries,
+            fallbacks=fallbacks,
+            **kwargs
+        )
+        try:
+            for chunk in response_stream:
+                # 使用 cast 来告诉类型检查器 chunk 的类型
+                chunk = cast(Any, chunk)
+                # 检查 chunk 是否有 choices 属性，并且不是 None
+                if hasattr(chunk, 'choices') and chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if hasattr(delta, 'content') and delta.content:
+                        yield delta.content
+        except Exception as e:
+            # 处理可能的异常
+            raise e
+
+    def stream_with_tools(
+        self,
+        prompt: Union[str, List[Dict]],
+        tools: Optional[List[Dict]] = None,
+        **kwargs: Any,
+    ) -> Generator[StreamChunk, None, None]:
+        """Stream content/tool-call deltas in a normalized chunk format."""
+        def _safe_int(value: Any) -> int:
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, (int, float)):
+                return int(value)
+            if isinstance(value, str):
+                raw = value.strip()
+                if not raw:
+                    return 0
+                try:
+                    return int(raw)
+                except ValueError:
+                    try:
+                        return int(float(raw))
+                    except ValueError:
+                        return 0
+            return 0
+
+        if isinstance(prompt, str):
+            messages = [{"role": "user", "content": prompt}]
+        elif isinstance(prompt, list):
+            messages = prompt
+        else:
+            raise ValueError(f"Unsupported prompt type: {type(prompt)}")
+
+        timeout = kwargs.pop("timeout", self.timeout)
+        if timeout is None:
+            from agenticx.runtime.provider_fallback import _resolve_llm_round_timeout_seconds_from_config
+
+            timeout = _resolve_llm_round_timeout_seconds_from_config()
+        max_retries = kwargs.pop("max_retries", self.max_retries)
+        fallbacks = kwargs.pop("fallbacks", self.fallbacks)
+        stream_options = kwargs.pop("stream_options", None)
+        if not isinstance(stream_options, dict):
+            stream_options = {}
+        # Ask provider to include usage in streamed chunks when available.
+        stream_options["include_usage"] = True
+        self._apply_drop_params_default(kwargs)
+        self._apply_extra_body(kwargs)
+        model_lower = str(self.model or "").lower()
+        if "minimax" in model_lower:
+            extra = kwargs.get("extra_body")
+            if not isinstance(extra, dict):
+                extra = {}
+                kwargs["extra_body"] = extra
+            extra.setdefault("reasoning_split", True)
+        _no_proxy_client = _build_no_proxy_openai_client(self.api_key, self.base_url)
+        if _no_proxy_client is not None:
+            kwargs.setdefault("client", _no_proxy_client)
+        response_stream = litellm.completion(
+            model=self.model,
+            messages=messages,
+            tools=tools,
+            stream=True,
+            stream_options=stream_options,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            api_version=self.api_version,
+            timeout=timeout,
+            max_retries=max_retries,
+            fallbacks=fallbacks,
+            **kwargs,
+        )
+        last_finish_reason = ""
+        reasoning_started = False
+        reasoning_closed = False
+        try:
+            for chunk in response_stream:
+                chunk = cast(Any, chunk)
+                usage_chunk: Dict[str, int] | None = None
+                usage = getattr(chunk, "usage", None)
+                if usage:
+                    if isinstance(usage, dict):
+                        pt = _safe_int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+                        ct = _safe_int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+                        tt = _safe_int(usage.get("total_tokens") or 0)
+                    else:
+                        pt = _safe_int(
+                            getattr(usage, "prompt_tokens", 0) or getattr(usage, "input_tokens", 0) or 0
+                        )
+                        ct = _safe_int(
+                            getattr(usage, "completion_tokens", 0)
+                            or getattr(usage, "output_tokens", 0)
+                            or 0
+                        )
+                        tt = _safe_int(getattr(usage, "total_tokens", 0) or 0)
+                    if tt == 0 and (pt > 0 or ct > 0):
+                        tt = pt + ct
+                    if pt > 0 or ct > 0 or tt > 0:
+                        usage_chunk = {
+                            "prompt_tokens": pt,
+                            "completion_tokens": ct,
+                            "total_tokens": tt,
+                        }
+                choices = getattr(chunk, "choices", None)
+                if choices:
+                    choice0 = choices[0]
+                    finish_reason = getattr(choice0, "finish_reason", None)
+                    if isinstance(finish_reason, str) and finish_reason:
+                        last_finish_reason = finish_reason
+                    delta = getattr(choice0, "delta", None)
+                    if delta is not None:
+                        # Reasoning models (MiniMax M2.x/M3, DeepSeek-R1, etc.) may stream
+                        # reasoning_content before content after tool results. Forward as
+                        # <think> so the UI keeps receiving tokens and idle
+                        # stall detection does not fire during the thinking phase.
+                        for reasoning_delta in _iter_reasoning_delta_texts(delta):
+                            if not reasoning_started:
+                                reasoning_started = True
+                                yield {"type": "content", "text": "<think>"}
+                            yield {"type": "content", "text": reasoning_delta}
+                        content = getattr(delta, "content", None)
+                        if isinstance(content, str) and content:
+                            if reasoning_started and not reasoning_closed:
+                                reasoning_closed = True
+                                yield {"type": "content", "text": "</think>\n"}
+                            yield {"type": "content", "text": content}
+                        tool_calls = getattr(delta, "tool_calls", None)
+                        if tool_calls:
+                            for tc in tool_calls:
+                                tc_any = cast(Any, tc)
+                                idx = getattr(tc_any, "index", 0)
+                                tc_id = getattr(tc_any, "id", "") or ""
+                                fn_obj = getattr(tc_any, "function", None)
+                                raw_fn_name = getattr(fn_obj, "name", "") if fn_obj is not None else ""
+                                fn_name = str(raw_fn_name) if isinstance(raw_fn_name, str) else ""
+                                if fn_name.lower() == "none":
+                                    fn_name = ""
+                                fn_args = getattr(fn_obj, "arguments", "") if fn_obj is not None else ""
+                                yield {
+                                    "type": "tool_call_delta",
+                                    "tool_index": int(idx) if isinstance(idx, int) else 0,
+                                    "tool_call_id": str(tc_id),
+                                    "tool_name": fn_name,
+                                    "arguments_delta": str(fn_args),
+                                }
+                if usage_chunk:
+                    yield {"type": "usage", "usage": usage_chunk}
+            if reasoning_started and not reasoning_closed:
+                yield {"type": "content", "text": "</think>"}
+            yield {"type": "done", "finish_reason": last_finish_reason}
+        except Exception as e:
+            raise e
+
+    async def _astream_generator(self, prompt: Union[str, List[Dict]], **kwargs) -> AsyncGenerator[Union[str, Dict], None]:
+        """Internal method to create the async generator for streaming."""
+        # 处理不同的输入类型
+        if isinstance(prompt, str):
+            messages = [{"role": "user", "content": prompt}]
+        elif isinstance(prompt, list):
+            messages = prompt
+        else:
+            raise ValueError(f"Unsupported prompt type: {type(prompt)}")
+            
+        # 获取流式响应
+        timeout = kwargs.pop("timeout", self.timeout)
+        if timeout is None:
+            from agenticx.runtime.provider_fallback import _resolve_llm_round_timeout_seconds_from_config
+
+            timeout = _resolve_llm_round_timeout_seconds_from_config()
+        max_retries = kwargs.pop("max_retries", self.max_retries)
+        fallbacks = kwargs.pop("fallbacks", self.fallbacks)
+        self._apply_drop_params_default(kwargs)
+        self._apply_extra_body(kwargs)
+        _no_proxy_async_client = _build_no_proxy_async_openai_client(self.api_key, self.base_url)
+        if _no_proxy_async_client is not None:
+            kwargs.setdefault("client", _no_proxy_async_client)
+        response_stream = await litellm.acompletion(
+            model=self.model,
+            messages=messages,
+            stream=True,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            api_version=self.api_version,
+            timeout=timeout,
+            max_retries=max_retries,
+            fallbacks=fallbacks,
+            **kwargs
+        )
+        
+        # 异步迭代处理流式响应
+        try:
+            # 告诉类型检查器 response_stream 是可异步迭代的
+            async_stream = cast(AsyncGenerator[Any, None], response_stream)
+            async for chunk in async_stream:
+                # 使用 cast 来告诉类型检查器 chunk 的类型
+                chunk = cast(Any, chunk)
+                # 检查 chunk 是否有 choices 属性，并且不是 None
+                if hasattr(chunk, 'choices') and chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if hasattr(delta, 'content') and delta.content:
+                        yield delta.content
+                    elif hasattr(delta, 'tool_calls') and delta.tool_calls:
+                        # 如果是工具调用，返回整个 delta
+                        yield {"role": "assistant", "tool_calls": delta.tool_calls}
+                elif hasattr(chunk, 'choices') and not chunk.choices:
+                    # 处理空 choices 的情况
+                    continue
+        except Exception as e:
+            # 处理可能的异常
+            raise e
+
+    async def astream(self, prompt: Union[str, List[Dict]], **kwargs) -> AsyncGenerator[Union[str, Dict], None]:
+        """Stream the language model's response asynchronously."""
+        async_gen = self._astream_generator(prompt, **kwargs)
+        # 为了满足类型检查器的要求，我们需要返回一个协程
+        # 但实际上我们直接返回异步生成器
+        return async_gen
+
+    def _parse_response(self, response) -> LLMResponse:
+        """Parses a LiteLLM ModelResponse into an AgenticX LLMResponse."""
+        import logging as _logging
+        _logging.getLogger(__name__).debug(
+            "[litellm] raw usage: %r  hidden_params: %r",
+            getattr(response, "usage", None),
+            getattr(response, "_hidden_params", None),
+        )
+        usage = response.usage or {}
+
+        # Handle usage as dict or object.
+        if isinstance(usage, dict):
+            prompt_tokens = int(usage.get("prompt_tokens") or 0)
+            completion_tokens = int(usage.get("completion_tokens") or 0)
+            total_tokens = int(usage.get("total_tokens") or 0)
+        else:
+            prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+
+        # Some providers (e.g. MiniMax via openai-compat) put usage inside
+        # _hidden_params or the raw response dict; fall back to those when the
+        # primary usage fields are all zero.
+        if prompt_tokens == 0 and completion_tokens == 0:
+            hidden = getattr(response, "_hidden_params", None) or {}
+            raw_usage: dict = {}
+            if isinstance(hidden, dict):
+                raw_usage = hidden.get("usage") or hidden.get("original_response_usage") or {}
+            if not raw_usage:
+                # Try model_extra or __dict__ path
+                for _attr in ("model_extra", "__dict__"):
+                    _d = getattr(response, _attr, None)
+                    if isinstance(_d, dict) and "usage" in _d:
+                        raw_usage = _d["usage"] or {}
+                        break
+            if raw_usage:
+                if isinstance(raw_usage, dict):
+                    prompt_tokens = int(raw_usage.get("prompt_tokens") or 0)
+                    completion_tokens = int(raw_usage.get("completion_tokens") or 0)
+                    total_tokens = int(raw_usage.get("total_tokens") or 0)
+                else:
+                    prompt_tokens = int(getattr(raw_usage, "prompt_tokens", 0) or 0)
+                    completion_tokens = int(getattr(raw_usage, "completion_tokens", 0) or 0)
+                    total_tokens = int(getattr(raw_usage, "total_tokens", 0) or 0)
+
+        if total_tokens == 0 and (prompt_tokens > 0 or completion_tokens > 0):
+            total_tokens = prompt_tokens + completion_tokens
+
+        token_usage = TokenUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+
+        choices = [
+            LLMChoice(
+                index=choice.index,
+                content=choice.message.content or "",
+                finish_reason=choice.finish_reason
+            ) for choice in response.choices
+        ]
+        
+        main_content = choices[0].content if choices else ""
+
+        # Extract tool_calls from the first choice's message
+        raw_tool_calls = None
+        if response.choices:
+            msg = getattr(response.choices[0], "message", None)
+            if msg is not None:
+                tc_list = getattr(msg, "tool_calls", None)
+                if tc_list:
+                    raw_tool_calls = []
+                    for tc in tc_list:
+                        fn_obj = getattr(tc, "function", None)
+                        raw_fn_name = getattr(fn_obj, "name", "") if fn_obj is not None else ""
+                        fn_name = str(raw_fn_name) if isinstance(raw_fn_name, str) else ""
+                        if fn_name.lower() == "none":
+                            fn_name = ""
+                        raw_tool_calls.append({
+                            "id": getattr(tc, "id", ""),
+                            "type": getattr(tc, "type", "function"),
+                            "function": {
+                                "name": fn_name,
+                                "arguments": getattr(fn_obj, "arguments", "{}") if fn_obj is not None else "{}",
+                            },
+                        })
+
+        # Safely retrieve cost information
+        cost = 0.0
+        if hasattr(response, 'completion_cost'):
+            cost = float(response.completion_cost) if response.completion_cost else 0.0
+        elif hasattr(response, 'cost'):
+            if isinstance(response.cost, dict):
+                cost = response.cost.get("completion_cost", 0.0)
+            else:
+                cost = float(response.cost) if response.cost else 0.0
+
+        return LLMResponse(
+            id=response.id,
+            model_name=response.model,
+            created=response.created,
+            content=main_content,
+            choices=choices,
+            token_usage=token_usage,
+            cost=cost,
+            metadata={
+                "_response_ms": getattr(response, "_response_ms", None),
+                "custom_llm_provider": getattr(response, "custom_llm_provider", None),
+            },
+            tool_calls=raw_tool_calls,
+        )
+
+    def generate(self, prompt: Union[str, List[Dict]], **kwargs) -> str:
+        """Generate text response from a simple prompt string.
+        
+        Args:
+            prompt: The input prompt string
+            **kwargs: Additional generation parameters
+            
+        Returns:
+            Generated text content as string
+        """
+        response = self.invoke(prompt, **kwargs)
+        return response.content
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "LiteLLMProvider":
+        model = config.get("model")
+        if not model:
+            raise ValueError("Model must be specified in config")
+        base_url = config.get("base_url")
+        raw_extra_body = config.get("extra_body")
+        extra_body = raw_extra_body if isinstance(raw_extra_body, dict) else None
+        return cls(
+            model=model,
+            api_key=_resolve_litellm_api_key(config.get("api_key"), base_url),
+            base_url=base_url,
+            api_version=config.get("api_version"),
+            timeout=config.get("timeout"),
+            max_retries=config.get("max_retries"),
+            fallbacks=config.get("fallbacks"),
+            drop_params=config.get("drop_params"),
+            extra_body=extra_body,
+        )
