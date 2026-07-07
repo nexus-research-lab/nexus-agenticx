@@ -49,6 +49,7 @@ from agenticx.runtime.events import EventType, RuntimeEvent
 from agenticx.runtime.hooks import HookRegistry
 from agenticx.runtime.loop_detector import LoopDetector
 from agenticx.runtime.llm_retry import LLMRetryPolicy, _classify_error
+from agenticx.runtime.subagent_runs import SubAgentRunStore
 from agenticx.runtime.token_budget import BudgetLevel, TokenBudgetGuard
 from agenticx.runtime.usage_metadata import usage_metadata_from_llm_response
 from agenticx.runtime.followup_stream import (
@@ -112,6 +113,100 @@ def _chat_history_append_deduped(history: List[Dict[str, Any]], row: Dict[str, A
         return False
     history.append(row)
     return True
+
+
+def _append_subagent_cluster_anchor_if_needed(
+    session: Any,
+    *,
+    tool_name: str,
+    tool_call_id: str,
+    raw_result: str,
+) -> bool:
+    """Append/update a lightweight persisted cluster anchor for spawn/delegate tool results."""
+    if tool_name not in {"spawn_subagent", "delegate_to_avatar"}:
+        return False
+    sid = str(
+        getattr(session, "_session_id", "")
+        or getattr(session, "_owner_session_id", "")
+        or getattr(session, "session_id", "")
+        or ""
+    ).strip()
+    if not sid:
+        return False
+    try:
+        payload = json.loads(str(raw_result or ""))
+    except Exception:
+        return False
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return False
+    run_id = ""
+    if tool_name == "spawn_subagent":
+        run_id = str(payload.get("agent_id", "") or "").strip()
+    else:
+        run_id = str(
+            payload.get("delegation_id", "")
+            or payload.get("agent_id", "")
+            or ""
+        ).strip()
+    if not run_id:
+        return False
+    try:
+        store = SubAgentRunStore(sid)
+        record = store.get_run(run_id)
+        if record is None:
+            return False
+        cluster = None
+        for item in store.list_clusters():
+            if item.cluster_id == record.cluster_id:
+                cluster = item
+                break
+        run_ids = list(cluster.run_ids) if cluster is not None else [record.run_id]
+        if record.run_id not in run_ids:
+            run_ids.append(record.run_id)
+        cluster_id = str(record.cluster_id or "").strip()
+        if not cluster_id:
+            return False
+        created_at = float(cluster.created_at if cluster is not None else record.created_at)
+        title = str(cluster.title if cluster is not None else "").strip()
+        if not title:
+            title = f"Agent 蜂群 · {len(run_ids)} 个并行任务"
+        anchor = {
+            "cluster_id": cluster_id,
+            "run_ids": run_ids,
+            "title": title,
+            "created_at": created_at,
+        }
+        history = getattr(session, "chat_history", None)
+        if not isinstance(history, list):
+            return False
+        for row in history:
+            if not isinstance(row, dict):
+                continue
+            meta = row.get("metadata")
+            if not isinstance(meta, dict):
+                continue
+            existing = meta.get("subagent_cluster")
+            if not isinstance(existing, dict):
+                continue
+            if str(existing.get("cluster_id", "") or "").strip() != cluster_id:
+                continue
+            if existing == anchor:
+                return False
+            meta["subagent_cluster"] = anchor
+            return True
+        history.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "metadata": {"subagent_cluster": anchor},
+                "timestamp": created_at,
+                "source_tool_call_id": str(tool_call_id or "").strip() or None,
+            }
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[subagent_anchor] append failed: %s", exc)
+        return False
 
 
 def _env_int_runtime(key: str, default: int) -> int:
@@ -2895,16 +2990,35 @@ class AgentRuntime:
             # --- Widget flow guard: detect text-based diagrams and force retry ---
             if not tool_calls and "show_widget" in allowed_tool_names:
                 from agenticx.runtime.widget_flow_guard import (
+                    WIDGET_FLOW_MAX_RETRIES_PER_SESSION,
                     WIDGET_FLOW_RETRY_HINT,
                     contains_text_flow_diagram,
                 )
 
-                if contains_text_flow_diagram(response_text) and not getattr(
-                    session, "_widget_flow_retried", False
+                _widget_flow_retry_count = getattr(
+                    session, "_widget_flow_retry_count", 0
+                )
+                if (
+                    contains_text_flow_diagram(response_text)
+                    and _widget_flow_retry_count < WIDGET_FLOW_MAX_RETRIES_PER_SESSION
                 ):
-                    setattr(session, "_widget_flow_retried", True)
+                    setattr(
+                        session,
+                        "_widget_flow_retry_count",
+                        _widget_flow_retry_count + 1,
+                    )
                     logger.info(
-                        "widget_flow_guard: detected text flow diagram, forcing retry"
+                        "widget_flow_guard: detected text flow diagram, forcing retry (count=%s)",
+                        _widget_flow_retry_count + 1,
+                    )
+                    yield RuntimeEvent(
+                        type=EventType.ERROR.value,
+                        data={
+                            "detector": "widget_flow_guard",
+                            "action": "discard_stream",
+                            "severity": "internal",
+                        },
+                        agent_id=agent_id,
                     )
                     messages.append({"role": "assistant", "content": ac_clean})
                     messages.append({"role": "system", "content": WIDGET_FLOW_RETRY_HINT})
@@ -2912,6 +3026,26 @@ class AgentRuntime:
                     session.agent_messages.append({"role": "system", "content": WIDGET_FLOW_RETRY_HINT})
                     continue
             # --- End widget flow guard ---
+            # --- Data source flow guard: uncited quantitative claims ---
+            if (
+                not tool_calls
+                and "query_data_source" in allowed_tool_names
+                and agent_id == "meta"
+            ):
+                from agenticx.runtime.data_source_flow_guard import detect_uncited_quant_claim
+
+                ds_nudge = detect_uncited_quant_claim(ac_clean, executed_tool_names)
+                if ds_nudge and not getattr(session, "_data_source_flow_retried", False):
+                    setattr(session, "_data_source_flow_retried", True)
+                    logger.info(
+                        "data_source_flow_guard: uncited quant claim, forcing retry"
+                    )
+                    messages.append({"role": "assistant", "content": ac_clean})
+                    messages.append({"role": "system", "content": ds_nudge})
+                    session.agent_messages.append({"role": "assistant", "content": ac_clean})
+                    session.agent_messages.append({"role": "system", "content": ds_nudge})
+                    continue
+            # --- End data source flow guard ---
             assistant_message: Dict[str, Any] = {"role": "assistant", "content": ac_clean}
             if tool_calls:
                 assistant_message["tool_calls"] = tool_calls
@@ -3777,6 +3911,13 @@ class AgentRuntime:
                             "tool_status": "error" if str(result).startswith("ERROR:") else "done",
                         }
                     )
+                    if _append_subagent_cluster_anchor_if_needed(
+                        session,
+                        tool_name=tool_name,
+                        tool_call_id=tool_call_id,
+                        raw_result=raw_result,
+                    ):
+                        self._tools_since_persist += 1
 
                 self._tools_since_persist += 1
                 self._maybe_mid_turn_persist()

@@ -20,6 +20,7 @@ from agenticx.runtime.prompts.credential_safety import (
     CREDENTIAL_SAFETY_BLOCK,
     CREDENTIAL_SAFETY_MCP_HINT,
 )
+from agenticx.llms.provider_display import build_provider_catalog_block, format_model_option_label, resolve_provider_config
 from agenticx.workspace.loader import load_subject_workspace_context
 
 
@@ -627,7 +628,7 @@ def _build_widget_capability_block() -> str:
         "独占一行的 `↓`/`▼`、或多行箭头/步骤链；\n"
         "  - 用纯文字冒充流程图（反例：「微信PC客户端 -> mitmproxy -> 微信服务器 ↓ 拦截接口」放在代码块或正文里）；\n"
         "  - ASCII/框线字符（`+---`、`│`、`┌─┐`）画架构/流程；\n"
-        "  - 输出 ```mermaid``` / PlantUML / Graphviz 源码让用户自行渲染；\n"
+        "  - 已调用 `show_widget` 出图后，又在正文/代码块重复画架构或实现路径；\n"
         "  - 正文写「流程如下」「链路如下」却不调用 `show_widget`。\n"
         "- **SVG vs HTML**：\n"
         "  - 静态示意、流程图、架构图、对比柱状/条形图 → 手写 **SVG**（`<svg viewBox=\"0 0 680 H\" width=\"100%\">`）。\n"
@@ -635,9 +636,40 @@ def _build_widget_capability_block() -> str:
         "- **SVG 规范**：文字用 `var(--text-primary)` / `var(--text-muted)`；背景/边框可用 `var(--surface-card)` / `var(--border-subtle)`；"
         "强调色用 `rgb(var(--theme-color-rgb))`；箭头 marker 用 `stroke=\"context-stroke\"` 跟随连线颜色；"
         "模块用圆角矩形，层与层之间用箭头连接，中文标签要完整可读。\n"
+        "- **SVG 尺寸（防叠字/防裁切）**：`viewBox=\"0 0 W H\"` 的 W/H 必须**完整包住**所有图形与文字并留 ≥24px 边距；"
+        "表格/热力图/多行对比等内容越多 H 越大（按行数预估，禁止所有图共用同一固定高度）；"
+        "单元格内文字不得与相邻格重叠，标签列与数据列之间留足 x 间距；"
+        "长句用 `<foreignObject>` 换行或拆成多行 `<tspan>`，禁止把多段文字堆在同一坐标。\n"
         "- **CDN 白名单**（HTML 模式仅允许）：`cdnjs.cloudflare.com`、`esm.sh`、`cdn.jsdelivr.net`、`unpkg.com`。\n"
         "- 每次调用渲染 **一个** widget；`title` 必填且简短（会显示在工具卡标题）。\n"
-        "- **禁止**用 ImageGen/截图/HTML 文件落盘替代；纯矢量 SVG 或 sandbox iframe 内 HTML 即可。\n\n"
+        "- **禁止**用 ImageGen/截图/HTML 文件落盘替代；纯矢量 SVG 或 sandbox iframe 内 HTML 即可。\n"
+        "- **时间序列行情/宏观走势**：取数后优先 `show_widget(widget_code=<stock_chart JSON>)`；"
+        "K 线用 `chart_type: \"candlestick\"`，宏观趋势用 `chart_type: \"line\"`；"
+        "用户同时关注多只股票时，用 `watchlist` 数组一次出图（Desktop 顶部 Tab 可切换），"
+        "不要拆成多个 widget；并保留 `attribution` / `data_source_label` 来源角标。\n\n"
+    )
+
+
+def _build_data_source_discipline() -> str:
+    """Describe when the model must call query_data_source instead of guessing facts."""
+    return (
+        "## 查数纪律（query_data_source）— 硬性纪律\n"
+        "- 涉及股价/财务指标/宏观经济数据/企业工商/学术引用等**可核实的量化事实**时，"
+        "**禁止**凭训练记忆直接给出具体数字，必须先调用 `list_data_sources`（如不确定用哪个源）"
+        "再调用 `query_data_source` 取得真实数据。\n"
+        "- 取到的时间序列数据用于可视化时，按 show_widget 纪律渲染图表（`stock_chart` JSON 或 ECharts HTML），"
+        "不要退化为纯文字表格罗列。\n"
+        "- 股价 K 线**默认取 `days: 60`（约 3 个月）**：用户说「最近走势/最近一周走势/近期表现」等"
+        "泛化表述时，也按 60 天取数以保证图表不稀疏；仅当用户明确要精确的极短窗口（如「对比昨天和前天」）才用更小 days。\n"
+        "- **股票图必须用结构化 `stock_chart` JSON**（单股 `points` 或多股 `watchlist`），"
+        "把 `query_data_source` 返回的 OHLCV 行**原样**填进 `points`；"
+        "**严禁手写 `<div>`+ECharts `<script>` HTML 画股票图**（会出现白字看不见、图稀疏等问题）。\n"
+        "- `query_data_source` 返回已裁剪为 date/OHLC/volume，完整 60 行可一次拿全；"
+        "**禁止**因为「看起来被截断」就用更小 days 反复重查同一支股票——同一 symbol 至多查一次。\n"
+        "- 工作流：**先** 1–3 句可见衔接语 → **`query_data_source` 取数** → **`show_widget` 出图** → **后**分节解读；"
+        "解读中的数字必须与工具返回一致。\n"
+        "- 若所选数据源返回凭证缺失/连接失败，先尝试免费替代源（如 akshare/world_bank）；"
+        "全部失败时必须明确告知用户「当前数据源暂不可用，无法核实最新数据」，**严禁编造具体数值**。\n\n"
     )
 
 
@@ -799,7 +831,14 @@ def build_meta_agent_system_prompt(
         "- 必须中文。\n"
         "- 先给结论，再给依据。\n"
         "- 技术方案/架构/流程类回答：**先**写 1–3 句可见衔接语 → **再** `show_widget` 出图 → **后**分节文字解读；"
-        "禁止用 `->`/`→`/`↓` 文字链、```text``` 代码块或 ASCII 框线图代替可视化。\n"
+        "禁止用 `->`/`→`/`↓` 文字链、```text``` 代码块或 ASCII 框线图代替可视化；"
+        "**已用 `show_widget` 出图后，禁止在正文再用 ASCII/箭头/代码块重复画架构或实现路径。**\n"
+        "- **代码与 Prompt 模板展示纪律**（禁止无语言标注的 ``` 裸块，否则 Desktop 会显示为 TEXT）：\n"
+        "  - API 调用 / Python 脚本 → ```python\n"
+        "  - JSON schema / 结构化输出示例 → ```json\n"
+        "  - Prompt 模板 / 配置文件 → ```yaml\n"
+        "  - Shell 命令 → ```bash\n"
+        "  - 用户要求看 Prompt 模板时，必须给出完整 ```yaml 代码块，不得只用 bullet 罗列要点。\n"
         "- 需要用户决策时，明确给出选项（A/B/C），但仅限业务方案选择。\n\n"
         "## MCP 工具管理闭环\n"
         "- 当任务需要 MCP 能力时，先调用 `list_mcps` 查看配置与连接状态。\n"
@@ -858,6 +897,7 @@ def build_meta_agent_system_prompt(
         f"{_build_web_search_capability_block()}"
         f"{_build_url_vision_capability_block()}"
         f"{_build_widget_capability_block()}"
+        f"{_build_data_source_discipline()}"
         f"{_build_followup_questions_block()}"
         "## 子智能体完成后的主动汇报（关键）\n"
         "- 当「当前子智能体状态」或「历史子智能体结果」中出现 completed 或 failed 的子智能体，你 **必须在本轮回复中主动汇报**，包括：\n"
@@ -888,7 +928,9 @@ def build_meta_agent_system_prompt(
         "- `request_clarification` 会弹出阻塞交互框让用户点选预设选项或填写自定义文本；用户提交后，工具结果即用户答复，你须在同一回合内基于该答复继续执行，而不是结束回合等待用户重新发消息。\n"
         "- 调用要点：`prompt` 写清总体背景；**当存在 2 个及以上彼此独立的决策维度（如时长 / 文案 / 配色）时，必须使用 `decisions` 数组**——每项含 `id`、`question`、`options`，前端会按决策链分组展示；不要把多个维度的选项混进一个扁平 `options` 列表。单一综合问题时才用扁平 `options`（用户可多选）。`allow_free_text` 默认 true；`context` 仅放方案快照（键值摘要），不要替代 `decisions`。\n"
         "- 在无人值守/自动化会话中该工具会返回 `[CLARIFICATION_PENDING]` sentinel，此时应把待确认项写入待办并优雅结束本轮，不要重复发起同一提问。\n"
-        "- 权限类确认（写文件、执行命令）仍走原有 `confirm_required` 流程，不要用 `request_clarification` 替代。\n\n"
+        "- 权限类确认（写文件、执行命令）仍走原有 `confirm_required` 流程，不要用 `request_clarification` 替代。\n"
+        "- 涉及模型/厂商选择时，`prompt` 与 `options` 只能写用户可见的「厂商展示名/模型短名」（如「彩讯-外网/kimi-k2.6」「MOMA/GLM-5.2」），禁止出现 `custom_openai_*` 等内部配置 id。\n\n"
+        f"{build_provider_catalog_block(current_provider=session.provider_name or '', current_model=session.model_name or '')}"
         f"{todo_context}\n"
         f"{lsp_context}"
         f"{active_subagents}"
@@ -897,6 +939,7 @@ def build_meta_agent_system_prompt(
         f"{taskspaces_context}"
         f"{build_code_dev_prompt_blocks(session)}"
         "## 当前会话上下文\n"
+        f"- model_service: {format_model_option_label(session.provider_name or '', session.model_name or '', resolve_provider_config(session.provider_name or ''))}\n"
         f"- provider: {session.provider_name or 'default'}\n"
         f"- model: {session.model_name or 'default'}\n"
         f"{_build_context_files_block(session)}"

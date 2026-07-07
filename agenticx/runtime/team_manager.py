@@ -7,6 +7,7 @@ Author: Damon Li
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -31,6 +32,7 @@ from agenticx.runtime import (
 )
 from agenticx.runtime.resource_monitor import ResourceMonitor
 from agenticx.runtime.agent_runtime import STOP_MESSAGE
+from agenticx.runtime.subagent_runs import SubAgentRunStore
 
 _log = logging.getLogger(__name__)
 
@@ -144,8 +146,11 @@ class SubAgentContext:
     avatar_id: str = ""
     failure_count: int = 0
     escalation_level: int = 0
+    result_file: str = ""
     pause_detector: str = ""
     pause_retryable: bool = False
+    cluster_id: str = ""
+    badge_seq: str = ""
 
 
 class AgentTeamManager:
@@ -182,6 +187,7 @@ class AgentTeamManager:
         self._agent_sessions: Dict[str, StudioSession] = {}
         self._archived_agents: Dict[str, SubAgentContext] = {}
         self._archive_limit = 200
+        self._run_store = SubAgentRunStore(self.owner_session_id)
 
     @classmethod
     def collect_global_statuses(
@@ -566,6 +572,7 @@ class AgentTeamManager:
             self._agents[agent_id] = context
             context.status = SubAgentStatus.RUNNING
             context.updated_at = time.time()
+            self._run_store_open(context)
             self._tasks[agent_id] = asyncio.create_task(
                 self._run_subagent(context, allowed_tools=allowed_tools)
             )
@@ -580,6 +587,8 @@ class AgentTeamManager:
                 "status": context.status.value,
                 "depth": context.depth,
                 "mode": context.mode,
+                "cluster_id": context.cluster_id,
+                "badge_seq": context.badge_seq,
                 "provider": context.provider_name or self.base_session.provider_name or "",
                 "model": context.model_name or self.base_session.model_name or "",
             },
@@ -610,6 +619,8 @@ class AgentTeamManager:
             "task": context.task,
             "depth": context.depth,
             "mode": context.mode,
+            "cluster_id": context.cluster_id,
+            "badge_seq": context.badge_seq,
             "provider": context.provider_name or self.base_session.provider_name or "",
             "model": context.model_name or self.base_session.model_name or "",
             "workspace_dir": context.workspace_dir or self.base_session.workspace_dir or "",
@@ -626,6 +637,15 @@ class AgentTeamManager:
         self._cancelled.add(agent_id)
         context.status = SubAgentStatus.CANCELLED
         context.updated_at = time.time()
+        try:
+            self._run_store.update_status(
+                agent_id,
+                status=context.status.value,
+                error_text="任务已取消",
+                completed_at=context.updated_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[subagent_runs] cancel update failed for %s: %s", agent_id, exc)
         task = self._tasks.get(agent_id)
         if task is not None and not task.done():
             task.cancel()
@@ -689,6 +709,17 @@ class AgentTeamManager:
             self._tasks[agent_id] = task
 
         context.updated_at = time.time()
+        try:
+            self._run_store.update_status(agent_id, status=context.status.value)
+            self._run_store.append_activity(
+                agent_id,
+                event_type="note",
+                title="收到追问",
+                detail=text,
+                ts=context.updated_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[subagent_runs] follow-up update failed for %s: %s", agent_id, exc)
         await self._emit(
             RuntimeEvent(
                 type=EventType.SUBAGENT_PROGRESS.value,
@@ -720,41 +751,143 @@ class AgentTeamManager:
         self._agent_sessions[context.agent_id] = session
         return session
 
-    async def retry_subagent(self, agent_id: str, refined_task: Optional[str] = None) -> Dict[str, Any]:
-        previous = self._agents.get(agent_id)
-        if previous is None:
-            previous = self._find_by_name_or_avatar(agent_id)
-            if previous is not None:
-                agent_id = previous.agent_id
-        if previous is None:
+    def _resolve_subagent_context(self, agent_id: str) -> tuple[Optional[SubAgentContext], str]:
+        """Resolve a sub-agent context from active, archived, or alias lookup."""
+        query = agent_id.strip()
+        context = self._agents.get(query)
+        if context is None:
+            archived = self._archived_agents.pop(query, None)
+            if archived is not None:
+                self._agents[query] = archived
+                context = archived
+        if context is None:
+            context = self._find_by_name_or_avatar(query)
+            if context is not None:
+                resolved_id = context.agent_id
+                if resolved_id in self._archived_agents:
+                    self._archived_agents.pop(resolved_id, None)
+                if resolved_id not in self._agents:
+                    self._agents[resolved_id] = context
+                return context, resolved_id
+        if context is not None:
+            return context, context.agent_id
+        return None, query
+
+    async def retry_subagent(
+        self,
+        agent_id: str,
+        refined_task: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        context, agent_id = self._resolve_subagent_context(agent_id)
+        if context is None:
             return {"ok": False, "error": "not_found", "message": f"未找到子智能体: {agent_id}"}
-        if previous.status == SubAgentStatus.RUNNING:
+        if context.status == SubAgentStatus.RUNNING:
             return {"ok": False, "error": "still_running", "message": "子智能体仍在运行，无法重试"}
-        new_task = (refined_task or "").strip() or previous.task
-        if previous.error_text:
+
+        new_task = (refined_task or "").strip() or context.task
+        if context.error_text:
             new_task = (
                 f"{new_task}\n\n"
                 "请参考上次失败信息并避免重复问题：\n"
-                f"{previous.error_text}"
+                f"{context.error_text}"
             )
-        result = await self.spawn_subagent(
-            name=previous.name,
-            role=previous.role,
-            task=new_task,
-            source_tool_call_id=previous.source_tool_call_id,
-            provider=previous.provider_name or None,
-            model=previous.model_name or None,
-            workspace_dir=previous.workspace_dir or None,
-            system_prompt=previous.persona_prompt or None,
+
+        async with self._lock:
+            active = self._active_running_count()
+            max_concurrent = self.spawn_config.max_concurrent
+            if active >= max_concurrent:
+                return {
+                    "ok": False,
+                    "error": "max_concurrency_reached",
+                    "message": f"当前并行子智能体已达上限({max_concurrent})",
+                }
+            if active > 0:
+                spawn_check = self.resource_monitor.can_spawn(active_subagents=active)
+                if not spawn_check["allowed"]:
+                    return {
+                        "ok": False,
+                        "error": "resource_limit",
+                        "message": "当前资源占用较高，暂不建议继续启动子智能体",
+                        "resource": spawn_check,
+                    }
+
+            context.task = new_task
+            if provider is not None:
+                context.provider_name = str(provider).strip()
+            if model is not None:
+                context.model_name = str(model).strip()
+            context.status = SubAgentStatus.RUNNING
+            context.error_text = ""
+            context.final_text = ""
+            context.result_summary = ""
+            context.updated_at = time.time()
+            self._cancelled.discard(agent_id)
+            self._agent_sessions.pop(agent_id, None)
+
+            allowed_tools = self._build_toolset(context.allowed_tool_names)
+            self._tasks[agent_id] = asyncio.create_task(
+                self._run_subagent(context, allowed_tools=allowed_tools)
+            )
+
+        started_event = RuntimeEvent(
+            type=EventType.SUBAGENT_STARTED.value,
+            data={
+                "agent_id": context.agent_id,
+                "name": context.name,
+                "role": context.role,
+                "task": context.task,
+                "status": context.status.value,
+                "depth": context.depth,
+                "mode": context.mode,
+                "provider": context.provider_name or self.base_session.provider_name or "",
+                "model": context.model_name or self.base_session.model_name or "",
+                "retried": True,
+            },
+            agent_id=context.agent_id,
         )
-        if not result.get("ok"):
-            return result
-        new_agent_id = str(result.get("agent_id", "")).strip()
-        new_context = self._agents.get(new_agent_id)
-        if new_context is not None:
-            new_context.context_files.update(previous.context_files)
-            new_context.artifacts.update(previous.artifacts)
-        return result
+        await self._emit(started_event)
+        return {
+            "ok": True,
+            "agent_id": context.agent_id,
+            "name": context.name,
+            "role": context.role,
+            "task": context.task,
+            "depth": context.depth,
+            "mode": context.mode,
+            "provider": context.provider_name or self.base_session.provider_name or "",
+            "model": context.model_name or self.base_session.model_name or "",
+            "workspace_dir": context.workspace_dir or self.base_session.workspace_dir or "",
+            "retried": True,
+        }
+
+    async def update_subagent_model(
+        self,
+        agent_id: str,
+        *,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        context, agent_id = self._resolve_subagent_context(agent_id)
+        if context is None:
+            return {"ok": False, "error": "not_found", "message": f"未找到子智能体: {agent_id}"}
+        prov = str(provider or "").strip()
+        mod = str(model or "").strip()
+        if not prov and not mod:
+            return {"ok": False, "error": "invalid_args", "message": "provider or model is required"}
+        async with self._lock:
+            if prov:
+                context.provider_name = prov
+            if mod:
+                context.model_name = mod
+            context.updated_at = time.time()
+        return {
+            "ok": True,
+            "agent_id": agent_id,
+            "provider": context.provider_name or self.base_session.provider_name or "",
+            "model": context.model_name or self.base_session.model_name or "",
+        }
 
     async def submit_for_longrun(self, entry: Any) -> Dict[str, Any]:
         """Run one long-running task entry via :meth:`spawn_subagent` and await completion."""
@@ -993,9 +1126,12 @@ class AgentTeamManager:
             "mode": context.mode,
             "cleanup": context.cleanup,
             "spawn_tree_path": context.spawn_tree_path,
+            "cluster_id": context.cluster_id,
+            "badge_seq": context.badge_seq,
             "provider": context.provider_name or self.base_session.provider_name or "",
             "model": context.model_name or self.base_session.model_name or "",
             "output_files": list(context.output_files[:200]),
+            "result_file": context.result_file or "",
             "pending_confirm": pending_confirm,
             "pending_clarification": pending_clarification,
             "avatar_id": context.avatar_id or None,
@@ -1024,6 +1160,70 @@ class AgentTeamManager:
         )[:overflow]
         for agent_id in old_ids:
             self._archived_agents.pop(agent_id, None)
+
+    def _run_store_open(self, context: SubAgentContext) -> None:
+        """Open persisted run record for one spawned sub-agent."""
+        try:
+            record = self._run_store.open_run(
+                run_id=context.agent_id,
+                kind="spawn",
+                name=context.name,
+                role=context.role,
+                task=context.task,
+                status=context.status.value,
+                provider=context.provider_name or self.base_session.provider_name or "",
+                model=context.model_name or self.base_session.model_name or "",
+                persona=context.persona_prompt or "",
+                avatar_id=context.avatar_id or "",
+                source_tool_call_id=context.source_tool_call_id or "",
+                started_at=context.updated_at or time.time(),
+                detail_refs={
+                    "scratchpad_key": f"subagent_result::{context.agent_id}",
+                },
+            )
+            context.cluster_id = record.cluster_id
+            context.badge_seq = record.badge_seq
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[subagent_runs] open_run failed for %s: %s", context.agent_id, exc)
+
+    def _run_store_append_runtime_event(self, context: SubAgentContext, event: RuntimeEvent) -> None:
+        """Append one runtime event into persisted run activity timeline."""
+        try:
+            self._run_store.append_runtime_event(
+                context.agent_id,
+                event_type=event.type,
+                data=dict(event.data or {}),
+                ts=time.time(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[subagent_runs] append_runtime_event failed for %s: %s", context.agent_id, exc)
+
+    def _run_store_close(self, context: SubAgentContext, produced_files: List[str]) -> None:
+        """Finalize persisted run record after the sub-agent terminal status is known."""
+        artifacts: List[Dict[str, Any]] = []
+        for path in produced_files:
+            p = str(path or "").strip()
+            if not p:
+                continue
+            artifacts.append({"path": p, "kind": "file"})
+        detail_refs = {
+            "result_md_path": str(context.result_file or "").strip() or None,
+            "scratchpad_key": f"subagent_result::{context.agent_id}",
+        }
+        try:
+            self._run_store.close_run(
+                context.agent_id,
+                status=context.status.value,
+                result_summary=context.result_summary,
+                error_text=context.error_text,
+                result_file=context.result_file,
+                output_files=produced_files,
+                artifacts=artifacts,
+                detail_refs=detail_refs,
+                completed_at=context.updated_at or time.time(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[subagent_runs] close_run failed for %s: %s", context.agent_id, exc)
 
     async def _run_subagent(
         self,
@@ -1071,6 +1271,8 @@ class AgentTeamManager:
         heartbeat_stop = asyncio.Event()
         token_buffer = ""
         token_last_emit_at = time.time()
+        pending_activity_events: List[RuntimeEvent] = []
+        last_activity_flush_at = time.time()
 
         async def _emit_progress(text: str) -> None:
             await self._emit(
@@ -1105,6 +1307,18 @@ class AgentTeamManager:
             )
             token_buffer = ""
             token_last_emit_at = time.time()
+
+        def _flush_activity_events(force: bool = False) -> None:
+            nonlocal last_activity_flush_at
+            if not pending_activity_events:
+                return
+            now = time.time()
+            if not force and len(pending_activity_events) < 5 and (now - last_activity_flush_at) < 3.0:
+                return
+            for evt in pending_activity_events:
+                self._run_store_append_runtime_event(context, evt)
+            pending_activity_events.clear()
+            last_activity_flush_at = now
 
         try:
             def _should_stop() -> bool:
@@ -1156,11 +1370,16 @@ class AgentTeamManager:
                     EventType.TOOL_RESULT.value,
                     EventType.CONFIRM_REQUIRED.value,
                     EventType.CONFIRM_RESPONSE.value,
+                    EventType.CLARIFICATION_REQUIRED.value,
+                    EventType.CLARIFICATION_RESPONSE.value,
                     EventType.SUBAGENT_CHECKPOINT.value,
                     EventType.SUBAGENT_PAUSED.value,
+                    EventType.SUBAGENT_PROGRESS.value,
                     EventType.ERROR.value,
                 }:
                     context.recent_events.append({"type": event.type, "data": event.data})
+                    pending_activity_events.append(event)
+                    _flush_activity_events()
                 if event.type in {EventType.TOOL_CALL.value, EventType.TOOL_RESULT.value}:
                     tool_name = str(event.data.get("name", "tool"))
                     args = event.data.get("arguments") or event.data.get("args") or {}
@@ -1176,6 +1395,7 @@ class AgentTeamManager:
                     )
                     await _emit_progress(action)
                 await self._emit(event)
+            _flush_activity_events(force=True)
 
             await _flush_token_buffer()
 
@@ -1226,8 +1446,9 @@ class AgentTeamManager:
             context.agent_messages = list(session.agent_messages)
             context.artifacts = dict(session.artifacts)
             context.context_files = dict(session.context_files)
-            context.output_files = self._extract_output_files_from_messages(context.agent_messages)
+            context.output_files = self._finalize_output_files(context)
             context.result_summary = self._build_result_summary(context)
+            context.result_file = self._persist_result_file(context)
             produced_files = self._merge_output_files(context)
             missing_files = self._missing_output_files(produced_files)
             if (
@@ -1268,6 +1489,7 @@ class AgentTeamManager:
                 escalated = await self._auto_escalate(context, allowed_tools=allowed_tools)
                 if escalated:
                     return
+            self._run_store_close(context, produced_files)
 
             if self.summary_sink is not None:
                 await self.summary_sink(context.result_summary, context)
@@ -1285,6 +1507,7 @@ class AgentTeamManager:
                         "name": context.name,
                         "status": context.status.value,
                         "summary": context.result_summary,
+                        "result_file": context.result_file,
                         "text": context.final_text or context.error_text or context.result_summary,
                         "detector": context.pause_detector,
                         "retryable": context.pause_retryable,
@@ -1364,6 +1587,17 @@ class AgentTeamManager:
             context.final_text = ""
             context.recent_events.clear()
             context.updated_at = time.time()
+            try:
+                self._run_store.update_status(context.agent_id, status=context.status.value)
+                self._run_store.append_activity(
+                    context.agent_id,
+                    event_type="note",
+                    title=f"自动重试 {context.failure_count}/{max_escalation}",
+                    detail=error_summary,
+                    ts=context.updated_at,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("[subagent_runs] retry update failed for %s: %s", context.agent_id, exc)
             self._tasks[context.agent_id] = asyncio.create_task(
                 self._run_subagent(
                     context,
@@ -1400,6 +1634,17 @@ class AgentTeamManager:
         context.final_text = ""
         context.recent_events.clear()
         context.updated_at = time.time()
+        try:
+            self._run_store.update_status(context.agent_id, status=context.status.value)
+            self._run_store.append_activity(
+                context.agent_id,
+                event_type="note",
+                title=f"自动升级重试 {context.failure_count}/{max_escalation}",
+                detail=error_summary,
+                ts=context.updated_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[subagent_runs] escalation update failed for %s: %s", context.agent_id, exc)
         self._tasks[context.agent_id] = asyncio.create_task(
             self._run_subagent(
                 context,
@@ -1419,33 +1664,125 @@ class AgentTeamManager:
         )
         return True
 
+    def _persist_result_file(self, context: SubAgentContext) -> str:
+        """Write the subagent final output to disk and return the file path.
+
+        Saved under:
+            ~/.agenticx/sessions/<owner_session_id>/subagent_results/<agent_id>.md
+
+        Falls back to ~/.agenticx/subagent_results/ when no owner session is known.
+        Returns the absolute path string, or "" on any write failure.
+        """
+        text = (context.final_text or context.result_summary or "").strip()
+        if not text:
+            return ""
+        sid = (self.owner_session_id or "").strip()
+        if sid:
+            base = Path.home() / ".agenticx" / "sessions" / sid / "subagent_results"
+        else:
+            base = Path.home() / ".agenticx" / "subagent_results"
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            safe_name = re.sub(r"[^\w\-.]", "_", context.agent_id or "agent")
+            target = base / f"{safe_name}.md"
+            target.write_text(text, encoding="utf-8")
+            return str(target)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[team_manager] failed to persist result file for %s: %s", context.agent_id, exc)
+            return ""
+
     def _build_result_summary(self, context: SubAgentContext) -> str:
         file_list = self._merge_output_files(context)
+        name = (context.name or context.agent_id or "子智能体").strip()
         if context.status == SubAgentStatus.COMPLETED:
-            text = context.final_text or "任务执行完成"
-            summary = (
-                f"[{context.name}] 已完成。\n"
-                f"结果摘要: {text}\n"
-                f"产出文件: {', '.join(file_list) if file_list else '(无)'}"
-            )
+            text = (context.final_text or "任务执行完成").strip()
+            parts = [f"**{name}** 已完成。"]
+            if text:
+                parts.extend(["", text])
+            if file_list:
+                parts.extend(["", "产出文件："])
+                parts.extend(f"{idx}. {path}" for idx, path in enumerate(file_list, start=1))
+            summary = "\n".join(parts)
         elif context.status == SubAgentStatus.PAUSED:
-            text = context.final_text or "任务已暂停，可基于当前进展继续。"
+            text = (context.final_text or "任务已暂停，可基于当前进展继续。").strip()
             reason = f"暂停原因: {context.pause_detector or 'runtime_pause'}"
             retry = "可稍后继续。" if context.pause_retryable else "请根据提示继续指示。"
-            summary = (
-                f"[{context.name}] 已暂停。\n"
-                f"{reason}；{retry}\n"
-                f"阶段性摘要: {text}\n"
-                f"产出文件: {', '.join(file_list) if file_list else '(无)'}"
-            )
+            parts = [f"**{name}** 已暂停。", f"{reason}；{retry}"]
+            if text:
+                parts.extend(["", text])
+            if file_list:
+                parts.extend(["", "产出文件："])
+                parts.extend(f"{idx}. {path}" for idx, path in enumerate(file_list, start=1))
+            summary = "\n".join(parts)
         elif context.status == SubAgentStatus.CANCELLED:
-            summary = f"[{context.name}] 已取消。"
+            summary = f"**{name}** 已取消。"
         else:
-            summary = f"[{context.name}] 执行失败: {context.error_text or '未知错误'}"
-        # Approximate <=500 token with conservative 2000 chars.
-        if len(summary) > 2000:
-            summary = summary[:2000] + "...(truncated)"
+            err = (context.error_text or "未知错误").strip()
+            summary = f"**{name}** 执行失败：{err}"
         return summary
+
+    def _finalize_output_files(self, context: SubAgentContext) -> List[str]:
+        """Collect paths created or modified during this sub-agent run."""
+        tool_paths = self._extract_output_files_from_messages(context.agent_messages)
+        bash_paths = self._extract_bash_output_paths(context.agent_messages, context.workspace_dir)
+        mkdir_paths = self._extract_bash_mkdir_paths(context.agent_messages, context.workspace_dir)
+        artifact_paths = [str(path) for path in context.artifacts.keys()]
+        trusted: set[str] = set()
+        for raw in tool_paths:
+            if not raw:
+                continue
+            trusted.add(raw)
+            try:
+                trusted.add(str(Path(raw).expanduser().resolve()))
+            except OSError:
+                pass
+        return self._filter_task_produced_paths(
+            tool_paths + bash_paths + mkdir_paths + artifact_paths,
+            task_started_at=context.created_at,
+            trusted_paths=trusted,
+        )
+
+    @staticmethod
+    def _filter_task_produced_paths(
+        paths: Sequence[str],
+        *,
+        task_started_at: float,
+        trusted_paths: Optional[set[str]] = None,
+    ) -> List[str]:
+        """Keep only files/dirs written during the task; skip pre-existing scan targets."""
+        trusted = trusted_paths or set()
+        slack = 5.0
+        kept: List[str] = []
+        seen: set[str] = set()
+        for raw in paths:
+            if not raw:
+                continue
+            try:
+                candidate = Path(raw).expanduser()
+                if not candidate.exists():
+                    continue
+                resolved = str(candidate.resolve())
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            if resolved in trusted or raw in trusted:
+                seen.add(resolved)
+                kept.append(resolved)
+                continue
+            try:
+                stat = candidate.stat()
+            except OSError:
+                continue
+            if candidate.is_file():
+                if stat.st_mtime >= task_started_at - slack:
+                    seen.add(resolved)
+                    kept.append(resolved)
+            elif candidate.is_dir() and stat.st_mtime >= task_started_at - slack:
+                # Directory only if touched during the task (e.g. mkdir -p), not pre-existing roots.
+                seen.add(resolved)
+                kept.append(resolved)
+        return kept
 
     def _extract_output_files_from_messages(self, messages: List[Dict[str, Any]]) -> List[str]:
         paths: List[str] = []
@@ -1470,6 +1807,109 @@ class AgentTeamManager:
                 if path and path not in seen:
                     seen.add(path)
                     paths.append(path)
+        return paths
+
+    def _extract_bash_output_paths(
+        self, messages: List[Dict[str, Any]], workspace_dir: str
+    ) -> List[str]:
+        """Extract disk-verified output file paths from bash_exec redirections.
+
+        Scans assistant tool_calls for ``bash_exec`` commands and pulls targets of
+        ``>`` / ``>>`` / ``tee`` redirections. Only paths that actually exist on
+        disk are returned, so a mis-parsed or read-only path can never introduce a
+        false "missing artifact" failure. Relative paths resolve against
+        ``workspace_dir``.
+        """
+        base = Path(workspace_dir).expanduser() if str(workspace_dir or "").strip() else None
+        paths: List[str] = []
+        seen: set[str] = set()
+        redirect_re = re.compile(r"(?:>>?|\btee\b(?:\s+-a)?)\s+(['\"]?)([^\s'\"|;&<>]+)\1")
+        for msg in messages:
+            if str(msg.get("role", "")) != "assistant":
+                continue
+            for call in msg.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function") or {}
+                if str(fn.get("name", "") or "").strip() != "bash_exec":
+                    continue
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                    except Exception:
+                        continue
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    continue
+                command = str(args.get("command", "") or "")
+                if not command:
+                    continue
+                for match in redirect_re.finditer(command):
+                    raw = match.group(2).strip()
+                    if not raw or raw.startswith("/dev/"):
+                        continue
+                    candidate = Path(raw).expanduser()
+                    if not candidate.is_absolute() and base is not None:
+                        candidate = base / candidate
+                    try:
+                        if not candidate.exists() or candidate.is_dir():
+                            continue
+                    except Exception:
+                        continue
+                    resolved = str(candidate)
+                    if resolved not in seen:
+                        seen.add(resolved)
+                        paths.append(resolved)
+        return paths
+
+    def _extract_bash_mkdir_paths(
+        self, messages: List[Dict[str, Any]], workspace_dir: str
+    ) -> List[str]:
+        """Extract directories explicitly created via mkdir in bash_exec."""
+        base = Path(workspace_dir).expanduser() if str(workspace_dir or "").strip() else None
+        paths: List[str] = []
+        seen: set[str] = set()
+        mkdir_re = re.compile(r"\bmkdir\s+(?:-(?:p|m)\s+)*(['\"]?)([^\s'\"|;&<>]+)\1")
+        for msg in messages:
+            if str(msg.get("role", "")) != "assistant":
+                continue
+            for call in msg.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function") or {}
+                if str(fn.get("name", "") or "").strip() != "bash_exec":
+                    continue
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                    except Exception:
+                        continue
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    continue
+                command = str(args.get("command", "") or "")
+                if not command:
+                    continue
+                for match in mkdir_re.finditer(command):
+                    raw = match.group(2).strip()
+                    if not raw:
+                        continue
+                    candidate = Path(raw).expanduser()
+                    if not candidate.is_absolute() and base is not None:
+                        candidate = base / candidate
+                    try:
+                        if not candidate.is_dir():
+                            continue
+                    except Exception:
+                        continue
+                    resolved = str(candidate.resolve())
+                    if resolved not in seen:
+                        seen.add(resolved)
+                        paths.append(resolved)
         return paths
 
     def _merge_output_files(self, context: SubAgentContext) -> List[str]:

@@ -141,6 +141,7 @@ _CONCURRENCY_SAFE_STUDIO_TOOLS = frozenset(
         "web_fetch",
         "view_image",
         "show_widget",
+        "list_data_sources",
     }
 )
 
@@ -1122,6 +1123,64 @@ STUDIO_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_data_sources",
+            "description": (
+                "List enabled external data source plugins (finance/macro/academic/"
+                "enterprise/legal domains) and their available APIs. Call this first "
+                "when unsure which data_source_name or api_name to use with "
+                "query_data_source."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Optional filter, e.g. 'finance', 'macro', 'academic'.",
+                    },
+                    "verbose": {
+                        "type": "boolean",
+                        "description": "If true, include full params_schema for each API.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_data_source",
+            "description": (
+                "Unified gateway to query an external data source plugin (stock prices, "
+                "macro indicators, academic papers, company registry, legal statutes, etc). "
+                "Call list_data_sources first if you don't know the exact api_name or "
+                "params shape. Returns structured JSON; follow up with show_widget to "
+                "visualize when appropriate (e.g. price history as a chart)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data_source_name": {
+                        "type": "string",
+                        "description": "Plugin id, e.g. 'akshare', 'world_bank', 'tushare'.",
+                    },
+                    "api_name": {
+                        "type": "string",
+                        "description": "API id exposed by the plugin, from list_data_sources.",
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "API-specific parameters.",
+                    },
+                },
+                "required": ["data_source_name", "api_name", "params"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "show_widget",
             "description": (
                 "Render an inline SVG/HTML visualization in the chat. REQUIRED whenever you "
@@ -1129,7 +1188,10 @@ STUDIO_TOOLS: List[Dict[str, Any]] = [
                 "A->B->C style diagram — including simple 3-node chains. NEVER substitute "
                 "markdown text/code blocks (```text```, arrow chains, ↓ lines, mermaid source). "
                 "Before calling: output 1-3 sentences of visible intro prose in the same turn "
-                "(not in reasoning/thinking). Then call show_widget, then explain in detail."
+                "(not in reasoning/thinking). Then call show_widget, then explain in detail. "
+                "For structured stock/macro charts, widget_code MUST be JSON starting with "
+                '\'{"type": "stock_chart", ...}\' — the "type" field is REQUIRED, omitting it '
+                "will render as unreadable raw text instead of a chart."
             ),
             "parameters": {
                 "type": "object",
@@ -4950,6 +5012,31 @@ def _decode_patch_token(token: str) -> Tuple[Optional[dict[str, Any]], Optional[
         return None, f"invalid patch token: {exc}"
 
 
+def _looks_like_stock_chart_payload(parsed: Dict[str, Any]) -> bool:
+    """Detect a stock_chart JSON even if the model forgot the `type` field.
+
+    Models sometimes emit `{"chart_type": ..., "watchlist": [...]}` without the
+    literal `"type": "stock_chart"` marker. Recognizing the shape (watchlist /
+    points-with-OHLC-keys) avoids silently degrading to a raw-JSON HTML widget.
+    """
+    if parsed.get("type") == "stock_chart":
+        return True
+    if parsed.get("type") not in (None, "", "stock_chart"):
+        return False
+    watchlist = parsed.get("watchlist") or parsed.get("instruments") or parsed.get("series")
+    if isinstance(watchlist, list) and watchlist:
+        first = watchlist[0]
+        if isinstance(first, dict) and isinstance(first.get("points") or first.get("data"), list):
+            return True
+    rows = parsed.get("points") or parsed.get("data")
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        keys = {str(k).lower() for k in rows[0].keys()}
+        ohlc_keys = {"open", "high", "low", "close", "开盘", "最高", "最低", "收盘"}
+        if keys & ohlc_keys:
+            return True
+    return False
+
+
 def _tool_show_widget(arguments: Dict[str, Any]) -> str:
     """Return a widget payload JSON consumed by the Desktop ToolCallCard.
 
@@ -4966,6 +5053,15 @@ def _tool_show_widget(arguments: Dict[str, Any]) -> str:
     )
     if not widget_code.strip():
         return "ERROR: show_widget requires non-empty widget_code."
+    stripped = widget_code.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict) and _looks_like_stock_chart_payload(parsed):
+                parsed.setdefault("type", "stock_chart")
+                return json.dumps(parsed, ensure_ascii=False)
+        except json.JSONDecodeError:
+            pass
     payload = {
         "type": "widget",
         "title": title,
@@ -4973,6 +5069,82 @@ def _tool_show_widget(arguments: Dict[str, Any]) -> str:
         "loading_messages": loading_messages,
     }
     return json.dumps(payload, ensure_ascii=False)
+
+
+_DATA_SOURCE_REGISTRY: Optional[Any] = None
+
+
+def _get_data_source_registry() -> Any:
+    global _DATA_SOURCE_REGISTRY
+    if _DATA_SOURCE_REGISTRY is None:
+        from agenticx.data_sources.registry import build_registry_from_config
+
+        _DATA_SOURCE_REGISTRY = build_registry_from_config()
+    return _DATA_SOURCE_REGISTRY
+
+
+def reset_data_source_registry_cache() -> None:
+    """Clear cached registry (e.g. after config changes from Desktop settings)."""
+    global _DATA_SOURCE_REGISTRY
+    _DATA_SOURCE_REGISTRY = None
+
+
+async def _tool_list_data_sources(arguments: Dict[str, Any]) -> str:
+    registry = _get_data_source_registry()
+    domain_filter = str(arguments.get("domain") or "").strip().lower()
+    verbose = bool(arguments.get("verbose", False))
+    items: List[Dict[str, Any]] = []
+    for plugin in registry.list_plugins():
+        if domain_filter and plugin.domain.lower() != domain_filter:
+            continue
+        apis = plugin.list_apis()
+        items.append(
+            {
+                "name": plugin.name,
+                "display_name": plugin.display_name,
+                "domain": plugin.domain,
+                "requires_credential": plugin.requires_credential,
+                "apis": [
+                    {"name": a.name, "description": a.description}
+                    if not verbose
+                    else {
+                        "name": a.name,
+                        "description": a.description,
+                        "params_schema": a.params_schema,
+                    }
+                    for a in apis
+                ],
+            }
+        )
+    return json.dumps({"data_sources": items}, ensure_ascii=False)
+
+
+async def _tool_query_data_source(arguments: Dict[str, Any]) -> str:
+    from agenticx.data_sources.errors import DataSourceError, MissingCredentialError
+
+    registry = _get_data_source_registry()
+    data_source_name = str(arguments.get("data_source_name") or "").strip()
+    api_name = str(arguments.get("api_name") or "").strip()
+    params = arguments.get("params") or {}
+    if not isinstance(params, dict):
+        return "ERROR: query_data_source params must be an object."
+    if not data_source_name or not api_name:
+        return "ERROR: query_data_source requires data_source_name and api_name."
+    try:
+        result = await registry.call(data_source_name, api_name, params)
+    except MissingCredentialError:
+        return (
+            f"ERROR: data source '{data_source_name}' requires credentials. "
+            "Configure via Desktop 设置 → 数据源."
+        )
+    except DataSourceError as exc:
+        return f"ERROR: {exc}"
+    except Exception as exc:
+        logging.getLogger("agenticx.cli.agent_tools").warning(
+            "query_data_source unexpected failure: %s", exc
+        )
+        return f"ERROR: query_data_source failed unexpectedly: {exc}"
+    return json.dumps(result.to_dict(), ensure_ascii=False, default=str)
 
 
 def _tool_session_search(arguments: Dict[str, Any], session: Optional[StudioSession]) -> str:
@@ -6325,6 +6497,10 @@ async def dispatch_tool_async(
             return _tool_list_files(arguments, session)
         if name == "liteparse":
             return await _tool_liteparse(arguments, session)
+        if name == "list_data_sources":
+            return await _tool_list_data_sources(arguments)
+        if name == "query_data_source":
+            return await _tool_query_data_source(arguments)
         if name == "show_widget":
             return _tool_show_widget(arguments)
         if name == "task_experience_retrieve":

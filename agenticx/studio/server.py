@@ -32,6 +32,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from jsonschema import Draft202012Validator
 
+from agenticx.studio.context_file_keys import (
+    is_composer_upload_dedupe_key,
+    strip_composer_upload_dedupe_key,
+    upload_dedupe_size_from_key,
+)
 from agenticx.avatar.group_chat import GroupChatRegistry
 from agenticx.avatar.registry import AvatarRegistry
 from agenticx.branding import DEFAULT_META_PRODUCT_LABEL
@@ -76,6 +81,15 @@ from agenticx.runtime.group_router import (
     expand_mentions_with_meta_leader,
 )
 from agenticx.runtime.team_manager import AgentTeamManager
+from agenticx.runtime.subagent_runs import SubAgentRunStore
+from agenticx.studio.subagent_review import (
+    collect_memory_status_map,
+    list_subagent_clusters_payload,
+    merge_run_record_with_memory,
+    paginate_activity_entries,
+    preview_artifact_file,
+    resolve_artifact_path,
+)
 from agenticx.studio.protocols import (
     ChatRequest,
     ClarifyResponse,
@@ -1156,6 +1170,10 @@ def create_studio_app() -> FastAPI:
 
     register_memory_graph_routes(app, check_token=_check_token)
 
+    from agenticx.studio.data_sources_routes import register_data_sources_routes
+
+    register_data_sources_routes(app, check_token=_check_token)
+
     def _check_mcp_admin_token(x_agx_desktop_token: str | None) -> None:
         if not desktop_token:
             raise HTTPException(status_code=403, detail="desktop token required for MCP admin APIs")
@@ -1665,6 +1683,16 @@ def create_studio_app() -> FastAPI:
                     source_path = dir_parts[2]
                     composer_ref_label = dir_parts[1]
                     reference_token = True
+            elif is_composer_upload_dedupe_key(key):
+                display_name = os.path.basename(
+                    strip_composer_upload_dedupe_key(key).replace("\\", "/")
+                ) or strip_composer_upload_dedupe_key(key)
+                dedupe_size = upload_dedupe_size_from_key(key)
+                if dedupe_size is not None:
+                    size_val = dedupe_size
+                source_path = ""
+                reference_token = False
+                composer_ref_label = ""
             elif len(parts) >= 3 and parts[-1].isdigit() and parts[-2].isdigit():
                 source_path = str(parts[0] or "").strip()
                 display_name = os.path.basename(str(source_path).replace("\\", "/")) or source_path
@@ -3184,6 +3212,14 @@ def create_studio_app() -> FastAPI:
                     task_exc = runtime_task.exception()
                     if task_exc is not None and event_hub is None:
                         had_runtime_failure = True
+                        # Surface the swallowed runtime-task exception to the client
+                        # instead of a silent "done" — otherwise the desktop only
+                        # sees zero tokens + no persisted user turn, which the
+                        # stall-detection UI misreads as "上一轮未产出回答" with no
+                        # indication anything actually crashed.
+                        if not client_disconnected:
+                            err = SseEvent(type="error", data={"text": f"Runtime error: {task_exc}"})
+                            yield f"data: {json.dumps(err.model_dump(), ensure_ascii=False)}\n\n"
                 if event_hub is None:
                     from agenticx.studio.turn_interruption import resolve_turn_interruption_cause
 
@@ -3657,6 +3693,10 @@ def create_studio_app() -> FastAPI:
         session_id = str(payload.get("session_id", ""))
         agent_id = str(payload.get("agent_id", ""))
         refined_task = payload.get("task")
+        provider_raw = payload.get("provider")
+        model_raw = payload.get("model")
+        provider = str(provider_raw).strip() if isinstance(provider_raw, str) and provider_raw.strip() else None
+        model = str(model_raw).strip() if isinstance(model_raw, str) and model_raw.strip() else None
         if not session_id or not agent_id:
             raise HTTPException(status_code=400, detail="session_id and agent_id are required")
         managed = manager.get(session_id, touch=False)
@@ -3674,6 +3714,8 @@ def create_studio_app() -> FastAPI:
         result = await team_manager.retry_subagent(
             agent_id,
             str(refined_task) if isinstance(refined_task, str) and refined_task.strip() else None,
+            provider=provider,
+            model=model,
         )
         if not result.get("ok"):
             fallback_manager = AgentTeamManager.find_manager_for_agent(
@@ -3685,10 +3727,192 @@ def create_studio_app() -> FastAPI:
                 result = await fallback_manager.retry_subagent(
                     agent_id,
                     str(refined_task) if isinstance(refined_task, str) and refined_task.strip() else None,
+                    provider=provider,
+                    model=model,
                 )
             if not result.get("ok"):
                 raise HTTPException(status_code=400, detail=result.get("message", "retry failed"))
         return result
+
+    @app.post("/api/subagent/model")
+    async def update_subagent_model(
+        payload: dict,
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        _check_token(x_agx_desktop_token)
+        session_id = str(payload.get("session_id", ""))
+        agent_id = str(payload.get("agent_id", ""))
+        provider_raw = payload.get("provider")
+        model_raw = payload.get("model")
+        provider = str(provider_raw).strip() if isinstance(provider_raw, str) and provider_raw.strip() else None
+        model = str(model_raw).strip() if isinstance(model_raw, str) and model_raw.strip() else None
+        if not session_id or not agent_id:
+            raise HTTPException(status_code=400, detail="session_id and agent_id are required")
+        if not provider and not model:
+            raise HTTPException(status_code=400, detail="provider or model is required")
+        managed = manager.get(session_id, touch=False)
+        if managed is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        team_manager = managed.team_manager
+        if team_manager is None:
+            team_manager = AgentTeamManager.find_manager_for_agent(
+                agent_id,
+                include_archived=True,
+                session_id=session_id,
+            )
+            if team_manager is None:
+                raise HTTPException(status_code=404, detail="agent team not initialized")
+        result = await team_manager.update_subagent_model(
+            agent_id,
+            provider=provider,
+            model=model,
+        )
+        if not result.get("ok"):
+            fallback_manager = AgentTeamManager.find_manager_for_agent(
+                agent_id,
+                include_archived=True,
+                session_id=session_id,
+            )
+            if fallback_manager is not None and fallback_manager is not team_manager:
+                result = await fallback_manager.update_subagent_model(
+                    agent_id,
+                    provider=provider,
+                    model=model,
+                )
+            if not result.get("ok"):
+                raise HTTPException(status_code=400, detail=result.get("message", "update model failed"))
+        return result
+
+    @app.get("/api/session/subagent-clusters")
+    async def session_subagent_clusters(
+        session_id: str = Query(...),
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        _check_token(x_agx_desktop_token)
+        sid = str(session_id or "").strip()
+        if not sid:
+            return {"ok": False, "error": "session_id is required", "detail": "missing session_id"}
+        try:
+            memory_map = collect_memory_status_map(sid)
+            store = SubAgentRunStore(sid)
+            clusters = list_subagent_clusters_payload(
+                session_id=sid,
+                store=store,
+                memory_map=memory_map,
+            )
+            return {"ok": True, "clusters": clusters}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[subagent-clusters] sid=%s failed: %s", sid, exc)
+            return {"ok": False, "error": "subagent clusters read failed", "detail": str(exc)}
+
+    @app.get("/api/subagent/run")
+    async def subagent_run_detail(
+        session_id: str = Query(...),
+        run_id: str = Query(...),
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        _check_token(x_agx_desktop_token)
+        sid = str(session_id or "").strip()
+        rid = str(run_id or "").strip()
+        if not sid or not rid:
+            return {
+                "ok": False,
+                "error": "session_id and run_id are required",
+                "detail": "missing query params",
+            }
+        try:
+            store = SubAgentRunStore(sid)
+            record = store.get_run(rid)
+            if record is None:
+                return {"ok": False, "error": "run not found", "detail": rid}
+            memory = collect_memory_status_map(sid).get(rid)
+            return {"ok": True, "run": merge_run_record_with_memory(record, memory)}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[subagent/run] sid=%s run=%s failed: %s", sid, rid, exc)
+            return {"ok": False, "error": "run read failed", "detail": str(exc)}
+
+    @app.get("/api/subagent/run/activity")
+    async def subagent_run_activity(
+        session_id: str = Query(...),
+        run_id: str = Query(...),
+        offset: int = Query(default=0),
+        limit: int = Query(default=100),
+        order: str = Query(default="asc"),
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        _check_token(x_agx_desktop_token)
+        sid = str(session_id or "").strip()
+        rid = str(run_id or "").strip()
+        if not sid or not rid:
+            return {
+                "ok": False,
+                "error": "session_id and run_id are required",
+                "detail": "missing query params",
+            }
+        try:
+            store = SubAgentRunStore(sid)
+            record = store.get_run(rid)
+            if record is None:
+                return {"ok": False, "error": "run not found", "detail": rid}
+            entries, total, safe_offset, safe_limit = paginate_activity_entries(
+                store.read_activity(rid),
+                offset=offset,
+                limit=limit,
+                order=order,
+            )
+            return {
+                "ok": True,
+                "entries": entries,
+                "total": total,
+                "offset": safe_offset,
+                "limit": safe_limit,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[subagent/run/activity] sid=%s run=%s failed: %s", sid, rid, exc)
+            return {"ok": False, "error": "activity read failed", "detail": str(exc)}
+
+    @app.get("/api/subagent/run/artifact-preview")
+    async def subagent_run_artifact_preview(
+        session_id: str = Query(...),
+        run_id: str = Query(...),
+        path: str = Query(...),
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        _check_token(x_agx_desktop_token)
+        sid = str(session_id or "").strip()
+        rid = str(run_id or "").strip()
+        requested_path = str(path or "").strip()
+        if not sid or not rid or not requested_path:
+            return {
+                "ok": False,
+                "error": "session_id, run_id and path are required",
+                "detail": "missing query params",
+            }
+        try:
+            store = SubAgentRunStore(sid)
+            record = store.get_run(rid)
+            if record is None:
+                return {"ok": False, "error": "run not found", "detail": rid}
+            allowed, resolved, reason = resolve_artifact_path(
+                requested_path=requested_path,
+                record=record,
+                owner_session_id=sid,
+            )
+            if not allowed or resolved is None:
+                return {"ok": False, "error": "path not allowed", "detail": reason or requested_path}
+            preview = preview_artifact_file(resolved)
+            if not preview.get("ok"):
+                return preview
+            return preview
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[subagent/run/artifact-preview] sid=%s run=%s path=%s failed: %s",
+                sid,
+                rid,
+                requested_path,
+                exc,
+            )
+            return {"ok": False, "error": "artifact preview failed", "detail": str(exc)}
 
     @app.get("/api/mcp/servers")
     async def list_mcp_servers(
@@ -4280,6 +4504,7 @@ def create_studio_app() -> FastAPI:
             "todo_write": "agent", "scratchpad_write": "agent", "scratchpad_read": "agent",
             "memory_append": "memory", "memory_search": "memory", "session_search": "memory",
             "liteparse": "document",
+            "list_data_sources": "data_source", "query_data_source": "data_source",
             "schedule_task": "scheduling", "list_scheduled_tasks": "scheduling", "cancel_scheduled_task": "scheduling",
             "spawn_subagent": "meta", "cancel_subagent": "meta", "retry_subagent": "meta",
             "query_subagent_status": "meta", "check_resources": "meta", "recommend_subagent_model": "meta",
